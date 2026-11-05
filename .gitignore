@@ -56,3 +56,12 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.env.*
+
+# Local runtime artifacts (do not publish)
+artifacts/
+**/browser-profiles/
+*.local.json
+lv-handbags-test.json
+shopify-collection-smoke.json
+lv-interactive-*.json

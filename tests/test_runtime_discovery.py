@@ -95,7 +95,7 @@ async def test_real_worker_loopback_sorted():
 
 @pytest.mark.asyncio
 async def test_robots_disallow_before_fetch_and_emit():
- r,s=await local({'/robots.txt':(200,'User-agent: ShopExtract\nDisallow: /private\nDisallow: /sitemap.xml'),'/sitemap.xml':(200,xml('/private'))})
+ r,s=await local({'/robots.txt':(200,'User-agent: ProductHarbor\nDisallow: /private\nDisallow: /sitemap.xml'),'/sitemap.xml':(200,xml('/private'))})
  assert not r and all('/sitemap' not in u for u in s) and 'robots_disallowed' in r.reasons
 
 @pytest.mark.asyncio

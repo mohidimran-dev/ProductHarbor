@@ -24,6 +24,10 @@ class ExecutionPolicy:
     browser: bool = False
     llm: LLMBudget | None = None
     secrets: tuple[str, ...] = ()
+    # Opt-in headed Playwright session with a persistent profile. Never implied
+    # by browser=True alone; does not solve CAPTCHAs or bypass protections.
+    interactive_browser: bool = False
+    browser_profile_dir: str | None = None
 
 
 @dataclass
@@ -157,6 +161,11 @@ def current_policy() -> ExecutionPolicy | None:
 def browser_allowed() -> bool:
     policy = current_policy()
     return policy is None or policy.browser
+
+
+def interactive_browser_enabled() -> bool:
+    policy = current_policy()
+    return bool(policy is not None and policy.interactive_browser and policy.browser)
 
 
 @contextmanager

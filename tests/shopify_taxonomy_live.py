@@ -35,7 +35,7 @@ async def probe(result):
     try:
         catalog=load_shopify_taxonomy(catalog_root=Path('build/shopify-taxonomy/catalogs'))
         result['catalog_fingerprint']=catalog.fingerprint
-        async with httpx.AsyncClient(transport=wire,timeout=10,trust_env=False,follow_redirects=False,headers={'User-Agent':'ShopExtract/0.1.2'}) as client:
+        async with httpx.AsyncClient(transport=wire,timeout=10,trust_env=False,follow_redirects=False,headers={'User-Agent':'ProductHarbor/0.1.2'}) as client:
             response=await request(client,'GET',STORE+'/products/'+HANDLE+'.json')
             product=response.json().get('product')
             if not isinstance(product,dict):raise ValueError('public_product_unavailable')

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "shopextract"
 version = "0.1.2"
-description = "Extract, compare, and monitor product data from any e-commerce store"
+description = "ProductHarbor — extract, compare, and monitor product data from any e-commerce store"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -39,6 +39,7 @@ dev = ["jsonschema>=4.20", "pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.22",
 
 [project.scripts]
 shopextract = "shopextract.cli:main"
+shopextract-dashboard = "shopextract.dashboard.__main__:cli"
 
 [project.urls]
 Homepage = "https://github.com/umerkhan95/shopextract"

@@ -45,7 +45,7 @@ _CHOICES = {"output_format": ("legacy", "json"), "diagnostics": ("normal", "quie
 _ROOT = {"--config": "config", "--output-format": "output_format", "--diagnostics": "diagnostics"}
 _ENV = {"output_format": "SHOPEXTRACT_OUTPUT_FORMAT", "diagnostics": "SHOPEXTRACT_DIAGNOSTICS"}
 _EXITS = {"E_USAGE": 2, "E_CONFIG": 2, "E_PARTIAL": 3, "E_VALIDATION": 4, "E_CANCELLED": 130}
-_CODES = {"E_OPERATION", "E_INTERNAL", "E_DEPENDENCY", "E_TIMEOUT", *_EXITS}
+_CODES = {"E_OPERATION", "E_INTERNAL", "E_DEPENDENCY", "E_TIMEOUT", "ACCESS_BLOCKED", *_EXITS}
 
 
 def settings() -> CliSettings:

@@ -173,12 +173,40 @@ async def extract(
     from ._execution import configure_progress_result
     configure_progress_result(platform,observation_scope,restore_short_gtin=restore_short_gtin,shop_url=shop_url)
 
+    from ._access import ACCESS_BLOCKED, format_access_blocked, is_access_blocked_message
+    from ._execution import interactive_browser_enabled
+
+    # Opt-in headed browser runs before HTTP/API so a seed 403 does not skip the human gate.
+    if interactive_browser_enabled():
+        return await _extract_interactive_collection(
+            url,
+            platform=platform,
+            observation_scope=observation_scope,
+            max_urls=max_urls,
+            api_errors=[],
+            shop_url=shop_url,
+        )
+
     # Step 2: Try API extraction first
     api_kwargs = {'max_products': max_urls, 'enrich_identifiers': enrich_identifiers}
     if enrich_variants:api_kwargs['enrich_variants']=True
     if api_options:
         api_kwargs['api_options'] = api_options
     api_result = await _try_api_extraction(url, platform, **api_kwargs)
+    if api_result is not None and (
+            api_result.completeness_reason == ACCESS_BLOCKED or is_access_blocked_message(api_result.error)):
+        return ExtractionResult(
+            observation_scope=observation_scope,
+            catalog_complete=False,
+            incompleteness_reasons=[ACCESS_BLOCKED],
+            products=[],
+            raw_products=[],
+            tier=ExtractionTier.API,
+            platform=platform,
+            urls_attempted=1,
+            urls_succeeded=0,
+            errors=[api_result.error] if api_result.error else [f'{ACCESS_BLOCKED} url={url} status=403 reason=http_403'],
+        )
     if api_result is not None and (api_result.products or api_result.complete):
         truncated = len(api_result.products) > max_urls
         api_result.products = api_result.products[:max_urls]
@@ -224,6 +252,16 @@ async def extract(
             incompleteness_reasons=['customer_context_unavailable'], tier=ExtractionTier.API,
             platform=platform, errors=api_errors or ['BigCommerce customer context unavailable'])
 
+    seed_block = await _probe_access_block(url)
+    if seed_block is not None:
+        return ExtractionResult(
+            observation_scope=observation_scope,
+            catalog_complete=False,
+            incompleteness_reasons=[ACCESS_BLOCKED],
+            platform=platform,
+            errors=api_errors + [format_access_blocked(seed_block)],
+        )
+
     # Step 3: Discover URLs for crawl-based extraction
     from ._discover import discover
     # Borrow this operation's HTTP boundary; direct public discovery owns a worker.
@@ -244,6 +282,17 @@ async def extract(
     unified = UnifiedCrawlExtractor()
     sample_url = urls[0]
     probe_result = await unified.extract(sample_url)
+    if (probe_result.completeness_reason == ACCESS_BLOCKED
+            or is_access_blocked_message(probe_result.error)):
+        return ExtractionResult(
+            observation_scope=observation_scope,
+            catalog_complete=False,
+            incompleteness_reasons=[ACCESS_BLOCKED],
+            platform=platform,
+            urls_attempted=len(urls),
+            urls_succeeded=0,
+            errors=api_errors + ([probe_result.error] if probe_result.error else []),
+        )
 
     scorer = QualityScorer()
     if probe_result.products:
@@ -360,6 +409,9 @@ async def extract_one(
     result = await extractor.extract(url)
     if result.products:
         return result.products[0]
+    from ._access import ACCESS_BLOCKED, is_access_blocked_message
+    if result.completeness_reason == ACCESS_BLOCKED or is_access_blocked_message(result.error):
+        return {}
 
     # Explicit policy also governs nested single-page fallback.
     policy = current_policy()
@@ -413,6 +465,128 @@ async def from_feed(feed_url: str, *, shop_url: str = "") -> ExtractionResult:
 
 
 # -- Internal helpers ---------------------------------------------------------
+
+
+async def _probe_access_block(url: str):
+    """One guarded GET for access interstitials; does not bypass protections."""
+    from ._access import detect_access_block
+    from .extractors._http_defaults import DEFAULT_HEADERS, get_default_user_agent
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0,
+                                     headers={**DEFAULT_HEADERS, 'User-Agent': get_default_user_agent()}) as client:
+            response = await client.get(url)
+            return detect_access_block(url=str(response.url), status=response.status_code, body=response.text)
+    except httpx.HTTPError:
+        return None
+
+
+async def _extract_interactive_collection(
+    url: str,
+    *,
+    platform: Platform,
+    observation_scope: str,
+    max_urls: int,
+    api_errors: list[str],
+    shop_url: str,
+) -> ExtractionResult:
+    """Headed persistent-profile collection extract; human clears challenges."""
+    from decimal import Decimal, InvalidOperation
+    from pathlib import Path
+    from ._access import ACCESS_BLOCKED
+    from ._execution import current_policy, remaining_execution_seconds
+    from .extractors._interactive_browser import (
+        default_profile_dir,
+        interactive_extractor_result,
+    )
+    from ._models import Product, Variant
+    from .identity import assign_identity
+
+    policy = current_policy()
+    profile = Path(policy.browser_profile_dir) if policy and policy.browser_profile_dir else default_profile_dir(url)
+    remaining = remaining_execution_seconds()
+    # Reserve time for product navigation after the human gate.
+    human_timeout = 240.0 if remaining is None else max(30.0, min(240.0, remaining - 45.0))
+    session_meta: dict = {}
+    extractor = await interactive_extractor_result(
+        url,
+        max_products=max_urls,
+        profile_dir=profile,
+        human_timeout=human_timeout,
+        session_out=session_meta,
+    )
+    products: list[Product] = []
+    for raw in extractor.products:
+        try:
+            price = Decimal(str(raw['price'])) if raw.get('price') not in (None, '') else Decimal('0')
+        except (InvalidOperation, ValueError, TypeError):
+            price = Decimal('0')
+        variants = []
+        for item in raw.get('variants') or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                v_price = Decimal(str(item['price'])) if item.get('price') not in (None, '') else price
+            except (InvalidOperation, ValueError, TypeError):
+                v_price = price
+            variants.append(Variant(
+                variant_id=str(item.get('sku') or item.get('title') or '') or '',
+                title=str(item.get('title') or ''),
+                price=v_price,
+                sku=item.get('sku') if isinstance(item.get('sku'), str) else None,
+                attributes={str(k): str(v) for k, v in dict(item.get('options') or {}).items()},
+                featured_image=item.get('featured_image') if isinstance(item.get('featured_image'), str) else None,
+                featured_image_id=item.get('featured_image_id') if isinstance(item.get('featured_image_id'), str) else None,
+            ))
+        currency = raw.get('currency') if isinstance(raw.get('currency'), str) else ''
+        product = Product(
+            title=str(raw.get('title') or ''),
+            description=str(raw.get('description') or ''),
+            price=price,
+            currency=currency,
+            image_url=str(raw.get('image_url') or ''),
+            additional_images=[i for i in (raw.get('additional_images') or []) if isinstance(i, str)],
+            product_url=str(raw.get('product_url') or url),
+            sku=raw.get('sku') if isinstance(raw.get('sku'), str) else None,
+            variants=variants,
+            platform=platform,
+            raw_data=raw,
+        )
+        assign_identity(product, shop_url or url)
+        products.append(product)
+
+    reasons = []
+    if extractor.completeness_reason:
+        reasons.append(extractor.completeness_reason)
+    if extractor.error and extractor.completeness_reason != ACCESS_BLOCKED:
+        reasons.append('source_error')
+    catalog_complete = False
+    if extractor.completeness_reason == ACCESS_BLOCKED:
+        catalog_complete = False
+        reasons = [ACCESS_BLOCKED]
+    elif extractor.complete and products and not reasons:
+        catalog_complete = True
+    evidence_note = None
+    if session_meta.get('pagination_end_confirmed') is not None:
+        evidence_note = f"pagination_end_confirmed={session_meta['pagination_end_confirmed']}"
+    errors = list(api_errors)
+    if extractor.error:
+        errors.append(extractor.error)
+    if evidence_note and extractor.completeness_reason != ACCESS_BLOCKED:
+        errors.append(evidence_note)
+    return ExtractionResult(
+        observation_scope=observation_scope,
+        catalog_complete=catalog_complete,
+        incompleteness_reasons=list(dict.fromkeys(reasons)),
+        products=products,
+        raw_products=list(extractor.products),
+        tier=ExtractionTier.UNIFIED_CRAWL,
+        quality_score=QualityScorer().score_batch(extractor.products) if extractor.products else 0.0,
+        platform=platform,
+        urls_attempted=max(extractor.pages_completed or 0, len(extractor.products), 1),
+        urls_succeeded=len(products),
+        errors=errors,
+    )
+
 
 # Provider-specific env var mapping
 _PROVIDER_ENV_KEYS = {

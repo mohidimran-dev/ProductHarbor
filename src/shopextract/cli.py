@@ -204,11 +204,28 @@ def quality_cmd(file):
 
 
 async def _extract(url: str, max_urls: int, fmt: str, output_path: str | None) -> None:
+    from pathlib import Path
     from . import extract as do_extract
+    from ._access import ACCESS_BLOCKED, access_blocked_reason
     result = await do_extract(url, max_urls=max_urls)
     products = [_product_to_dict(p) for p in result.products]
+    blocked = access_blocked_reason(result.errors, result.incompleteness_reasons)
+    if blocked is not None:
+        click.echo(blocked if blocked != ACCESS_BLOCKED else
+                   f'{ACCESS_BLOCKED} url={url} status=unknown reason=access_blocked', err=True)
+        sys.exit(1)
 
     if output_path:
+        target = Path(output_path)
+        if not products:
+            if target.exists() and target.stat().st_size > 0:
+                click.echo(
+                    f"Preserved existing export at {output_path}; extraction returned 0 products.",
+                    err=True,
+                )
+            else:
+                click.echo("No products extracted; skipped writing empty output.", err=True)
+            sys.exit(1)
         _write_output(products, output_path, fmt)
         click.echo(f"Wrote {len(products)} products to {output_path}")
     else:

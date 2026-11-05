@@ -1,0 +1,259 @@
+(() => {
+  const NOTES = {
+    auto: 'Auto Detect finds the platform, then routes to the matching ProductHarbor extractor.',
+    shopify: 'Shopify uses the public products.json / collection API path.',
+    woocommerce: 'WooCommerce uses the Store API extractor.',
+    custom: 'Custom / Other uses the generic crawl path with browser support. Enable interactive headed browser for protected storefronts.',
+  };
+
+  const els = {
+    tabs: [...document.querySelectorAll('.tab')],
+    url: document.getElementById('url'),
+    start: document.getElementById('start'),
+    continueBtn: document.getElementById('continue'),
+    cancel: document.getElementById('cancel'),
+    interactive: document.getElementById('interactive'),
+    interactiveWrap: document.getElementById('interactive-wrap'),
+    note: document.getElementById('backend-note'),
+    state: document.getElementById('state'),
+    elapsed: document.getElementById('elapsed'),
+    platform: document.getElementById('platform'),
+    completeness: document.getElementById('completeness'),
+    discovered: document.getElementById('discovered'),
+    extracted: document.getElementById('extracted'),
+    failed: document.getElementById('failed'),
+    variants: document.getElementById('variants'),
+    message: document.getElementById('message'),
+    reasons: document.getElementById('reasons'),
+    preview: document.getElementById('preview'),
+    downloadProducts: document.getElementById('download-products'),
+    downloadReport: document.getElementById('download-report'),
+    downloadShopify: document.getElementById('download-shopify'),
+    livePanel: document.getElementById('live-panel'),
+    liveLabel: document.getElementById('live-label'),
+    liveImage: document.getElementById('live-image'),
+    liveEmpty: document.getElementById('live-empty'),
+  };
+
+  let lastLiveStamp = null;
+
+  let activeTab = 'auto';
+  let jobId = null;
+  let pollTimer = null;
+
+  function selectedMode() {
+    return document.querySelector('input[name="mode"]:checked')?.value || 'test';
+  }
+
+  function setBusy(busy) {
+    els.start.disabled = busy;
+    els.cancel.disabled = !busy;
+  }
+
+  function syncInteractiveVisibility() {
+    const show = activeTab === 'custom';
+    els.interactiveWrap.classList.toggle('hidden', !show);
+    if (!show) els.interactive.checked = false;
+  }
+
+  function renderJob(job) {
+    if (!job) return;
+    els.state.textContent = job.state;
+    els.state.className = `value state-${job.state}`;
+    els.elapsed.textContent = `${Number(job.elapsed_seconds || 0).toFixed(1)}s`;
+    els.platform.textContent = job.platform || '—';
+    if (job.catalog_complete === true) els.completeness.textContent = 'confirmed complete';
+    else if (job.catalog_complete === false) els.completeness.textContent = 'incomplete / partial';
+    else els.completeness.textContent = 'unverified';
+    els.discovered.textContent = String(job.counts?.discovered ?? 0);
+    els.extracted.textContent = String(job.counts?.extracted ?? 0);
+    els.failed.textContent = String(job.counts?.failed ?? 0);
+    els.variants.textContent = String(job.counts?.variants ?? 0);
+    els.message.textContent = job.message || '';
+    els.continueBtn.disabled = !(job.state === 'running' && job.interactive_browser);
+    els.reasons.innerHTML = '';
+    for (const reason of job.incompleteness_reasons || []) {
+      const li = document.createElement('li');
+      li.textContent = reason;
+      els.reasons.appendChild(li);
+    }
+    for (const error of job.errors || []) {
+      const li = document.createElement('li');
+      li.textContent = error;
+      els.reasons.appendChild(li);
+    }
+
+    const canProducts = Boolean(job.downloads?.products_json);
+    const canReport = Boolean(job.downloads?.report_json);
+    const canShopify = Boolean(job.downloads?.shopify_csv);
+    els.downloadProducts.classList.toggle('disabled', !canProducts);
+    els.downloadReport.classList.toggle('disabled', !canReport);
+    els.downloadShopify.classList.toggle('disabled', !canShopify);
+    els.downloadProducts.href = canProducts ? `/api/jobs/${job.job_id}/download/products` : '#';
+    els.downloadReport.href = canReport ? `/api/jobs/${job.job_id}/download/report` : '#';
+    els.downloadShopify.href = canShopify ? `/api/jobs/${job.job_id}/download/shopify` : '#';
+
+    const showLive = Boolean(job.interactive_browser);
+    els.livePanel.classList.toggle('hidden', !showLive);
+    if (showLive) {
+      const live = job.live_preview || {};
+      if (live.available) {
+        els.liveEmpty.hidden = true;
+        els.liveImage.hidden = false;
+        const stamp = live.updated_at || '';
+        if (stamp !== lastLiveStamp) {
+          lastLiveStamp = stamp;
+          els.liveImage.src = `/api/jobs/${job.job_id}/live-preview?t=${encodeURIComponent(stamp)}`;
+        }
+        els.liveLabel.textContent = live.label
+          ? `Browser snapshot: ${live.label}`
+          : 'Live browser snapshot';
+      } else {
+        els.liveImage.hidden = true;
+        els.liveEmpty.hidden = false;
+        els.liveEmpty.textContent = job.state === 'running'
+          ? 'Waiting for first browser snapshot…'
+          : 'No browser snapshot captured.';
+      }
+    }
+
+    const preview = job.preview || [];
+    if (!preview.length) {
+      els.preview.className = 'preview empty';
+      els.preview.textContent = job.state === 'running' ? 'Waiting for admitted products…' : 'No products yet.';
+      return;
+    }
+    els.preview.className = 'preview';
+    els.preview.innerHTML = '';
+    for (const item of preview) {
+      const card = document.createElement('article');
+      card.className = 'card';
+      if (item.image_url) {
+        const img = document.createElement('img');
+        img.alt = item.title || 'Product';
+        img.src = item.image_url;
+        img.loading = 'lazy';
+        card.appendChild(img);
+      } else {
+        const placeholder = document.createElement('div');
+        placeholder.style.cssText = 'aspect-ratio:1;background:#2a2724;';
+        card.appendChild(placeholder);
+      }
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const title = document.createElement('h3');
+      title.textContent = item.title || 'Untitled';
+      const price = document.createElement('p');
+      price.textContent = [item.price, item.currency].filter(Boolean).join(' ') || 'Price unavailable';
+      const variants = document.createElement('p');
+      variants.textContent = `${item.variant_count || 0} variants`;
+      meta.append(title, price, variants);
+      card.appendChild(meta);
+      els.preview.appendChild(card);
+    }
+  }
+
+  async function poll() {
+    if (!jobId) return;
+    try {
+      const response = await fetch(`/api/jobs/${jobId}`);
+      const payload = await response.json();
+      if (!payload.ok) {
+        els.message.textContent = payload.error || 'Job status unavailable.';
+        return;
+      }
+      renderJob(payload.job);
+      const terminal = ['succeeded', 'failed', 'cancelled', 'blocked', 'partial'].includes(payload.job.state);
+      if (terminal) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        setBusy(false);
+      }
+    } catch (error) {
+      els.message.textContent = `Status poll failed: ${error.message}`;
+    }
+  }
+
+  els.tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      activeTab = tab.dataset.tab;
+      els.tabs.forEach((button) => {
+        const on = button === tab;
+        button.classList.toggle('active', on);
+        button.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      els.note.textContent = NOTES[activeTab];
+      syncInteractiveVisibility();
+    });
+  });
+
+  els.start.addEventListener('click', async () => {
+    const url = els.url.value.trim();
+    if (!url) {
+      els.message.textContent = 'Enter a collection URL.';
+      return;
+    }
+    setBusy(true);
+    lastLiveStamp = null;
+    els.message.textContent = 'Starting job…';
+    els.reasons.innerHTML = '';
+    els.livePanel.classList.toggle('hidden', !(activeTab === 'custom' && els.interactive.checked));
+    els.liveImage.hidden = true;
+    els.liveEmpty.hidden = false;
+    els.liveEmpty.textContent = 'Waiting for first browser snapshot…';
+    try {
+      const response = await fetch('/api/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          tab: activeTab,
+          mode: selectedMode(),
+          interactive_browser: Boolean(els.interactive.checked && activeTab === 'custom'),
+        }),
+      });
+      const payload = await response.json();
+      if (!payload.ok) {
+        els.message.textContent = payload.error || 'Could not start job.';
+        setBusy(false);
+        return;
+      }
+      jobId = payload.job.job_id;
+      renderJob(payload.job);
+      clearInterval(pollTimer);
+      pollTimer = setInterval(poll, 700);
+      poll();
+    } catch (error) {
+      els.message.textContent = `Start failed: ${error.message}`;
+      setBusy(false);
+    }
+  });
+
+  els.continueBtn.addEventListener('click', async () => {
+    if (!jobId) return;
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/continue`, { method: 'POST' });
+      const payload = await response.json();
+      if (!payload.ok) {
+        els.message.textContent = payload.error || 'Continue failed.';
+        return;
+      }
+      renderJob(payload.job);
+    } catch (error) {
+      els.message.textContent = `Continue failed: ${error.message}`;
+    }
+  });
+
+  els.cancel.addEventListener('click', async () => {
+    if (!jobId) return;
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+      const payload = await response.json();
+      if (payload.ok) renderJob(payload.job);
+    } catch (error) {
+      els.message.textContent = `Cancel failed: ${error.message}`;
+    }
+  });
+
+  syncInteractiveVisibility();
+})();

@@ -201,7 +201,7 @@ def portable_output(records, destination):
 def inspect_value(value):
     from ._models import Variant
     if isinstance(value,Variant):
-        names=('variant_id','title','price','sku','in_stock','canonical_variant_id','attributes','gtin')
+        names=('variant_id','title','price','sku','in_stock','canonical_variant_id','attributes','gtin','featured_image','featured_image_id')
         return {name:inspect_value(getattr(value,name)) for name in names}
     if isinstance(value,dict):
         return {key:inspect_value(item) for key,item in value.items()}

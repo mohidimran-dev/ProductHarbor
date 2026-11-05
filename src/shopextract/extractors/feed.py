@@ -28,7 +28,7 @@ _NAMESPACES = {"g": _G_NS}
 _MAX_RESPONSE_SIZE = 10 * 1024 * 1024
 
 _FEED_HEADERS = {
-    "User-Agent": "ShopExtract/1.0 (Feed Parser)",
+    "User-Agent": "ProductHarbor/1.0 (Feed Parser)",
     "Accept": "application/xml, text/xml, text/csv, text/tab-separated-values, */*",
 }
 

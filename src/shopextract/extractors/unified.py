@@ -25,6 +25,7 @@ from .._models import ExtractorResult
 from .._execution import browser_allowed
 from .._capture import capture
 from .._structured_html import extract_structured_products, StructuredHTMLResult, coverage_issues
+from .._access import AccessBlockedError, detect_access_block, detect_access_block_from_crawl, format_access_blocked
 from .._product_admission import has_product_evidence, crawl_document_allowed
 
 from ._browser import (
@@ -63,7 +64,11 @@ class UnifiedCrawlExtractor:
         url = shop_url
         from .._execution import record_progress_attempt,record_progress_rows
         record_progress_attempt(url)
-        html = await self._fetch_html_httpx(url)
+        try:
+            html = await self._fetch_html_httpx(url)
+        except AccessBlockedError as exc:
+            return ExtractorResult(products=[], complete=False, error=str(exc),
+                                   completeness_reason='ACCESS_BLOCKED')
         if html:
             parsed = extract_structured_products(html, getattr(html, "source_url", url))
             products = parsed.products
@@ -84,7 +89,11 @@ class UnifiedCrawlExtractor:
         if not browser_allowed():
             return ExtractorResult(products=httpx_products)
 
-        browser_parsed = await self._extract_with_browser(url,include_diagnostics=True)
+        try:
+            browser_parsed = await self._extract_with_browser(url,include_diagnostics=True)
+        except AccessBlockedError as exc:
+            return ExtractorResult(products=[], complete=False, error=str(exc),
+                                   completeness_reason='ACCESS_BLOCKED')
         browser_products = browser_parsed.products
         if browser_products:record_progress_rows(browser_products,url)
         issues = coverage_issues(browser_parsed.diagnostics)
@@ -125,6 +134,11 @@ class UnifiedCrawlExtractor:
             ) as crawler:
                 results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
                 for result in results:
+                    block = detect_access_block_from_crawl(result, getattr(result, 'url', '') or '')
+                    if block is not None:
+                        return ExtractorResult(products=all_products, complete=False,
+                                               error=format_access_blocked(block),
+                                               completeness_reason='ACCESS_BLOCKED')
                     if not crawl_document_allowed(result):
                         error = "Browser document failed HTTP/product admission"
                         continue
@@ -152,13 +166,16 @@ class UnifiedCrawlExtractor:
             )
             try:
                 response = await client.get(url)
+                html = response.text
+                block = detect_access_block(url=str(response.url), status=response.status_code, body=html)
+                if block is not None:
+                    raise AccessBlockedError(block)
                 response.raise_for_status()
 
                 content_length = int(response.headers.get("content-length", 0))
                 if content_length > _MAX_RESPONSE_SIZE:
                     return None
 
-                html = response.text
                 if len(html) > _MAX_RESPONSE_SIZE:
                     return None
 
@@ -167,8 +184,10 @@ class UnifiedCrawlExtractor:
                 if self._http_client is None:
                     await client.aclose()
 
+        except AccessBlockedError:
+            raise
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (403, 429, 503):
+            if e.response.status_code in (429, 503):
                 logger.debug("httpx blocked (%d) for %s, will try browser", e.response.status_code, url)
             return None
         except httpx.RequestError as e:
@@ -207,15 +226,22 @@ class UnifiedCrawlExtractor:
                     crawl_config = get_crawl_config(stealth_level=level, scan_full_page=True)
                     try:
                         result = await crawler.arun(url=url, config=crawl_config)
+                        block = detect_access_block_from_crawl(result, url)
+                        if block is not None:
+                            raise AccessBlockedError(block)
                         if not crawl_document_allowed(result):
                             continue
                         parsed = self._extract_from_crawl_result(result, getattr(result, "url", None) or url,include_diagnostics=True)
                         products=parsed.products;diagnostics.extend(parsed.diagnostics)
                         if products:
                             return finish(products)
+                    except AccessBlockedError:
+                        raise
                     except Exception as e:
                         logger.debug("Browser crawl at stealth level %s failed for %s: %s", level.value, url, e)
                         continue
+        except AccessBlockedError:
+            raise
         except Exception as e:
             logger.warning("Browser startup error for %s: %s", url, e)
 

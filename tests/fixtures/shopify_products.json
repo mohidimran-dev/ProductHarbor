@@ -16,7 +16,9 @@
           "compare_at_price": "19.99",
           "sku": "ESP-250",
           "barcode": "4006381333931",
-          "inventory_quantity": 50
+          "inventory_quantity": 50,
+          "image_id": 9001,
+          "featured_image": {"src": "https://cdn.shopify.com/espresso-250.jpg", "id": 9001}
         },
         {
           "id": 2002,

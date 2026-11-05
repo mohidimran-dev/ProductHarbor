@@ -46,7 +46,7 @@ async def supplement_categories(products,config,*,client=None):
         ('authorization','cookie','x-shopify-storefront-access-token','shopify-storefront-private-token') for k in client.headers)
         or client.cookies):raise ValueError('Conflicting inherited Storefront credentials')
     headers={'X-Shopify-Storefront-Access-Token':config.access_token} if config.auth_mode=='token' else {}
-    async with storefront_client(client,10,{'User-Agent':'ShopExtract/0.1.2'},cookies=stateless_cookies()) as wire:
+    async with storefront_client(client,10,{'User-Agent':'ProductHarbor/0.1.2'},cookies=stateless_cookies()) as wire:
         for raw in products:
             # A caller-owned client may accept response cookies. Never replay
             # those on a later product; owned/native clients reject persistence.

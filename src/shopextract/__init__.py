@@ -1,4 +1,4 @@
-"""shopextract -- Extract, compare, and monitor product data from any e-commerce store.
+"""ProductHarbor -- Extract, compare, and monitor product data from any e-commerce store.
 
 Public API:
     detect(url) -> PlatformResult

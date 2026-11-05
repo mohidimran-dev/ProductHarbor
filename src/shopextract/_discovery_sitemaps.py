@@ -18,7 +18,7 @@ MAX_REQUESTS = 12
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 20 * 1024 * 1024
 MAX_SECONDS = 30.0
-USER_AGENT = 'ShopExtract/0.1'
+USER_AGENT = 'ProductHarbor/0.1'
 _CATEGORY_MAP = re.compile(r'(?:^|[_-])(?:categor(?:y|ies)|collections?|product_cat)(?:[_\-.]|$)', re.I)
 
 

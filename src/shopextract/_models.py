@@ -48,6 +48,9 @@ class Variant:
     canonical_variant_id: str = ""
     attributes: dict[str, str] = field(default_factory=dict)
     gtin: str | None = None
+    # Shopify publishes featured_image.src and image_id; leave null when absent.
+    featured_image: str | None = None
+    featured_image_id: str | None = None
 
     def trust_view(self, contract: TrustContract | None = None) -> dict:
         """Return explicit field support, preserving scalar compatibility."""

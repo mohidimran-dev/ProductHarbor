@@ -18,7 +18,7 @@ def load_config(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='ShopExtract read-only MCP stdio server')
+    parser = argparse.ArgumentParser(description='ProductHarbor read-only MCP stdio server')
     parser.add_argument('--config', required=True, help='Trusted local JSON operator configuration')
     args = parser.parse_args()
     try:

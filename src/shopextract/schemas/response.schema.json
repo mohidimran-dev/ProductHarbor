@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ShopExtract CLI response 1.0",
+  "title": "ProductHarbor CLI response 1.0",
   "x-contract-version": "1.0",
   "type": "object",
   "additionalProperties": false,

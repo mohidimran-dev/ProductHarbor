@@ -17,12 +17,17 @@ from ._cli_data import (atomic_json, extraction_data, products_from_value,
                         raw_records, read_json_file)
 from ._execution import ExecutionPolicy, LLMBudget, execution_policy
 from ._models import Platform
+from ._access import ACCESS_BLOCKED, access_blocked_reason
 from ._outcomes import assess_extraction_outcome
 
 
 def execution_options(llm=True):
-    options = [click.option('--timeout', type=float, default=None, help='Operation deadline seconds (0,300], bounded default30.'),
-               click.option('--browser/--no-browser', default=None, help='Explicit browser activation; bounded default off.')]
+    options = [click.option('--timeout', type=float, default=None, help='Operation deadline seconds (0,300], bounded default30. Interactive browser allows up to900.'),
+               click.option('--browser/--no-browser', default=None, help='Explicit browser activation; bounded default off.'),
+               click.option('--interactive-browser', is_flag=True,
+                            help='Opt-in headed Playwright with a persistent profile; human may clear challenges. Implies --browser.'),
+               click.option('--browser-profile', 'browser_profile_dir', type=click.Path(), default=None,
+                            help='Persistent Chromium profile directory for --interactive-browser.')]
     if llm:
         options += [click.option('--allow-llm', is_flag=True, help='Explicitly enable bounded inference; providers may bill timed-out work.'),
                     click.option('--llm-model', default='openai/gpt-4o-mini'),
@@ -46,10 +51,11 @@ def explicit_controls():
                for p in ctx.command.params)
 
 
-def validate_timeout(value):
-    value = 30.0 if value is None else value
-    if not math.isfinite(value) or not 0 < value <= 300:
-        raise CliFailure('E_USAGE', 'Timeout must be finite and greater than zero, at most300 seconds.')
+def validate_timeout(value, *, interactive=False):
+    ceiling = 900.0 if interactive else 300.0
+    value = (300.0 if interactive else 30.0) if value is None else value
+    if not math.isfinite(value) or not 0 < value <= ceiling:
+        raise CliFailure('E_USAGE', f'Timeout must be finite and greater than zero, at most{int(ceiling)} seconds.')
     return value
 
 
@@ -78,7 +84,8 @@ def _browser_preflight():
 
 
 def policy_options(options, secrets=()):
-    timeout = validate_timeout(options.get('timeout'))
+    interactive = bool(options.get('interactive_browser'))
+    timeout = validate_timeout(options.get('timeout'), interactive=interactive)
     allow = options.get('allow_llm', False)
     ctx = click.get_current_context()
     from click.core import ParameterSource
@@ -93,7 +100,13 @@ def policy_options(options, secrets=()):
     variable = options.get('llm_key_env', 'SHOPEXTRACT_LLM_API_KEY')
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', variable):
         raise CliFailure('E_USAGE', 'LLM key environment variable name is invalid.')
-    if options.get('browser'):
+    browser = bool(options.get('browser')) or interactive
+    profile = options.get('browser_profile_dir')
+    if profile is not None and not interactive:
+        raise CliFailure('E_USAGE', '--browser-profile requires --interactive-browser.')
+    if interactive and not browser:
+        raise CliFailure('E_USAGE', '--interactive-browser requires browser execution.')
+    if browser:
         _browser_preflight()
     budget = None
     if allow:
@@ -103,7 +116,13 @@ def policy_options(options, secrets=()):
         budget = LLMBudget(model, key, temperature, options['llm_max_calls'],
                            options['llm_max_output_tokens'], options['llm_max_input_bytes'])
         secrets = (*secrets, key)
-    return ExecutionPolicy(bool(options.get('browser')), budget, tuple(secrets)), timeout
+    return ExecutionPolicy(
+        browser=browser,
+        llm=budget,
+        secrets=tuple(secrets),
+        interactive_browser=interactive,
+        browser_profile_dir=str(profile) if profile else None,
+    ), timeout
 
 
 def storefront_options(path, platform):
@@ -180,6 +199,11 @@ def extract_store(url, max_urls, fmt, output_path, options):
         return extraction_data(result)
     data, warnings = run_operation(operation, policy, timeout, recover=extraction_data)
     data['errors'].extend(warnings)
+    blocked = access_blocked_reason(data['errors'], data['incompleteness_reasons'])
+    if blocked is not None:
+        # Do not write empty output over an existing export when access is blocked.
+        raise CliFailure(ACCESS_BLOCKED, blocked if blocked != ACCESS_BLOCKED else
+                         f'{ACCESS_BLOCKED} url={url} status=unknown reason=access_blocked')
     partial = assess_extraction_outcome(product_count=len(data['products']),
         catalog_complete=data['catalog_complete'], errors=data['errors'],
         incompleteness_reasons=data['incompleteness_reasons']) != 'complete'

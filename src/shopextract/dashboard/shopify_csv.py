@@ -1,0 +1,242 @@
+"""Map extracted products to Shopify Admin product CSV (template-compatible)."""
+from __future__ import annotations
+
+import csv
+import io
+import re
+from collections.abc import Iterable
+from pathlib import Path
+
+# Exact headers from Shopify product_template CSV sample.
+SHOPIFY_PRODUCT_HEADERS = [
+    'Title',
+    'URL handle',
+    'Description',
+    'Vendor',
+    'Product category',
+    'Type',
+    'Tags',
+    'Published on online store',
+    'Status',
+    'SKU',
+    'Variant Barcodes',
+    'Option1 name',
+    'Option1 value',
+    'Option1 Linked To',
+    'Option2 name',
+    'Option2 value',
+    'Option2 Linked To',
+    'Option3 name',
+    'Option3 value',
+    'Option3 Linked To',
+    'Price',
+    'Compare-at price',
+    'Cost per item',
+    'Charge tax',
+    'Tax code',
+    'Unit price total measure',
+    'Unit price total measure unit',
+    'Unit price base measure',
+    'Unit price base measure unit',
+    'Inventory tracker',
+    'Inventory quantity',
+    'Continue selling when out of stock',
+    'Weight value (grams)',
+    'Weight unit for display',
+    'Requires shipping',
+    'Fulfillment service',
+    'Product image URL',
+    'Image position',
+    'Image alt text',
+    'Variant image URL',
+    'Gift card',
+    'SEO title',
+    'SEO description',
+    'Color (product.metafields.shopify.color-pattern)',
+    'Google Shopping / Google product category',
+    'Google Shopping / Gender',
+    'Google Shopping / Age group',
+    'Google Shopping / Manufacturer part number (MPN)',
+    'Google Shopping / Ad group name',
+    'Google Shopping / Ads labels',
+    'Google Shopping / Condition',
+    'Google Shopping / Custom product',
+    'Google Shopping / Custom label 0',
+    'Google Shopping / Custom label 1',
+    'Google Shopping / Custom label 2',
+    'Google Shopping / Custom label 3',
+    'Google Shopping / Custom label 4',
+    'Packed product length',
+    'Packed product width',
+    'Packed product height',
+    'Packed product dimension unit',
+]
+
+
+def slugify_handle(title: str, *, fallback: str = 'product') -> str:
+    text = (title or '').strip().lower()
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    text = re.sub(r'-{2,}', '-', text).strip('-')
+    return text[:180] or fallback
+
+
+def _blank_row() -> dict[str, str]:
+    return {key: '' for key in SHOPIFY_PRODUCT_HEADERS}
+
+
+def _money(value) -> str:
+    if value is None or value == '':
+        return ''
+    return str(value)
+
+
+def _option_pairs(attributes: dict | None) -> list[tuple[str, str]]:
+    if not attributes:
+        return []
+    pairs = []
+    for key, value in attributes.items():
+        if value is None or value == '':
+            continue
+        pairs.append((str(key), str(value)))
+        if len(pairs) >= 3:
+            break
+    return pairs
+
+
+def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
+    """Build Shopify CSV rows from Product objects or export dicts. No invented facts."""
+    rows: list[dict[str, str]] = []
+    used_handles: set[str] = set()
+
+    for index, product in enumerate(products, start=1):
+        if isinstance(product, dict):
+            title = str(product.get('title') or '').strip()
+            description = str(product.get('description') or '')
+            price = _money(product.get('price'))
+            compare = _money(product.get('compare_at_price'))
+            sku = product.get('sku') if isinstance(product.get('sku'), str) else ''
+            image_url = product.get('image_url') if isinstance(product.get('image_url'), str) else ''
+            additional = [i for i in (product.get('additional_images') or []) if isinstance(i, str)]
+            variants = product.get('variants') or []
+            vendor = product.get('vendor') if isinstance(product.get('vendor'), str) else ''
+            product_type = product.get('product_type') if isinstance(product.get('product_type'), str) else ''
+        else:
+            title = str(getattr(product, 'title', '') or '').strip()
+            description = str(getattr(product, 'description', '') or '')
+            price = _money(getattr(product, 'price', None))
+            compare = _money(getattr(product, 'compare_at_price', None))
+            sku = getattr(product, 'sku', None) if isinstance(getattr(product, 'sku', None), str) else ''
+            image_url = str(getattr(product, 'image_url', '') or '')
+            additional = list(getattr(product, 'additional_images', None) or [])
+            variants = list(getattr(product, 'variants', None) or [])
+            vendor = getattr(product, 'vendor', None) if isinstance(getattr(product, 'vendor', None), str) else ''
+            product_type = getattr(product, 'product_type', None) if isinstance(getattr(product, 'product_type', None), str) else ''
+
+        if not title:
+            continue
+
+        handle = slugify_handle(title, fallback=f'product-{index}')
+        base = handle
+        suffix = 2
+        while handle in used_handles:
+            handle = f'{base}-{suffix}'
+            suffix += 1
+        used_handles.add(handle)
+
+        variant_rows = []
+        if variants:
+            for variant in variants:
+                if isinstance(variant, dict):
+                    v_title = variant.get('title') if isinstance(variant.get('title'), str) else ''
+                    v_sku = variant.get('sku') if isinstance(variant.get('sku'), str) else ''
+                    v_price = _money(variant.get('price')) or price
+                    v_image = variant.get('featured_image') if isinstance(variant.get('featured_image'), str) else ''
+                    options = _option_pairs(variant.get('options') or variant.get('attributes'))
+                else:
+                    v_title = str(getattr(variant, 'title', '') or '')
+                    v_sku = getattr(variant, 'sku', None) if isinstance(getattr(variant, 'sku', None), str) else ''
+                    v_price = _money(getattr(variant, 'price', None)) or price
+                    v_image = getattr(variant, 'featured_image', None) if isinstance(getattr(variant, 'featured_image', None), str) else ''
+                    options = _option_pairs(getattr(variant, 'attributes', None))
+                if not options and v_title:
+                    options = [('Title', v_title)]
+                variant_rows.append({
+                    'sku': v_sku or sku,
+                    'price': v_price,
+                    'compare': compare,
+                    'image': v_image,
+                    'options': options,
+                })
+        else:
+            variant_rows.append({
+                'sku': sku,
+                'price': price,
+                'compare': compare,
+                'image': '',
+                'options': [],
+            })
+
+        for variant_index, variant in enumerate(variant_rows):
+            row = _blank_row()
+            row['URL handle'] = handle
+            if variant_index == 0:
+                row['Title'] = title
+                row['Description'] = description
+                row['Vendor'] = vendor
+                row['Type'] = product_type
+                row['Published on online store'] = 'TRUE'
+                row['Status'] = 'Active'
+                row['Charge tax'] = 'TRUE'
+                row['Requires shipping'] = 'TRUE'
+                row['Fulfillment service'] = 'manual'
+                row['Gift card'] = 'FALSE'
+                row['Continue selling when out of stock'] = 'DENY'
+                if image_url:
+                    row['Product image URL'] = image_url
+                    row['Image position'] = '1'
+                    row['Image alt text'] = title
+                row['SEO title'] = title
+                if description:
+                    row['SEO description'] = description[:320]
+            row['SKU'] = variant['sku'] or ''
+            row['Price'] = variant['price'] or ''
+            row['Compare-at price'] = variant['compare'] or ''
+            if variant['image']:
+                row['Variant image URL'] = variant['image']
+            for option_index, (name, value) in enumerate(variant['options'][:3], start=1):
+                row[f'Option{option_index} name'] = name
+                row[f'Option{option_index} value'] = value
+            rows.append(row)
+
+        for image_index, extra in enumerate(additional, start=2):
+            image_row = _blank_row()
+            image_row['URL handle'] = handle
+            image_row['Product image URL'] = extra
+            image_row['Image position'] = str(image_index)
+            image_row['Image alt text'] = title
+            rows.append(image_row)
+
+    return rows
+
+
+def write_shopify_csv(products: Iterable, path: Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = products_to_shopify_rows(products)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=SHOPIFY_PRODUCT_HEADERS, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    temporary.replace(path)
+    return path
+
+
+def shopify_csv_text(products: Iterable) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=SHOPIFY_PRODUCT_HEADERS, extrasaction='ignore')
+    writer.writeheader()
+    for row in products_to_shopify_rows(products):
+        writer.writerow(row)
+    return buffer.getvalue()

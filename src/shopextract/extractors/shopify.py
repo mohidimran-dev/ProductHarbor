@@ -79,6 +79,14 @@ class ShopifyExtractor:
                         error = f"Server error {response.status_code} on page {page}"
                         break
 
+                    if response.status_code == 403:
+                        from .._access import detect_access_block, format_access_blocked
+                        block = detect_access_block(url=str(response.url), status=403, body=response.text)
+                        complete = False
+                        error = format_access_blocked(block)
+                        completeness_reason = 'ACCESS_BLOCKED'
+                        break
+
                     if response.status_code != 200:
                         complete = False
                         error = f"HTTP {response.status_code} on page {page}"

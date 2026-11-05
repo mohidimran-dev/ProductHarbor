@@ -463,7 +463,7 @@ async def fetch_woocommerce_category_tree(
     seen, reasons, number = set(), set(), 1
     try:
         async with httpx.AsyncClient(transport=transport, trust_env=False,
-            follow_redirects=False, timeout=None, headers={'User-Agent': 'ShopExtract/0.1.2'}) as client:
+            follow_redirects=False, timeout=None, headers={'User-Agent': 'ProductHarbor/0.1.2'}) as client:
             while True:
                 check()
                 if context.budget.requests_used >= limits.requests:

@@ -33,7 +33,7 @@ class GuardedSources:
                 shopify_endpoint=self.shopify_storefront.endpoint if self.shopify_storefront else None))
         try:
             async with httpx.AsyncClient(transport=transport, trust_env=False,
-                    follow_redirects=False, timeout=10, headers={'User-Agent': 'ShopExtract/0.1.2'}) as client:
+                    follow_redirects=False, timeout=10, headers={'User-Agent': 'ProductHarbor/0.1.2'}) as client:
                 norm, _ = await self.guard.authorize(url, context)
                 if name == 'discover':
                     return await self.discover(client, norm, maximum, context)
@@ -183,7 +183,7 @@ class GuardedSources:
                     from ..extractors._storefront import stateless_cookies
                     async with httpx.AsyncClient(transport=_TransportLease(transport),trust_env=False,
                             follow_redirects=False,timeout=10,cookies=stateless_cookies(),
-                            headers={'User-Agent':'ShopExtract/0.1.2'}) as category_client:
+                            headers={'User-Agent':'ProductHarbor/0.1.2'}) as category_client:
                         await supplement_categories(result.products,self.shopify_storefront,client=category_client)
                 if transport.last_error:
                     raise transport.last_error

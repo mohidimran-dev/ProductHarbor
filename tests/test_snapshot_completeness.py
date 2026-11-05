@@ -207,6 +207,41 @@ async def test_short_final_page_at_budget_can_prove_exhaustion():
     assert len(result.products) == 260 and result.complete and result.completeness_reason is None
 
 
+@pytest.mark.asyncio
+async def test_meaningful_multi_page_pagination_reaches_confirmed_end():
+    """Allbirds-sized single-page catalogs are not enough; require real page crossing."""
+    pages_seen = []
+
+    def respond(request):
+        page = int(request.url.params.get('page', '1'))
+        pages_seen.append(page)
+        if page == 1:
+            return httpx.Response(200, json={'products': raw_products(250)})
+        if page == 2:
+            # Distinct IDs so uniqueness across pages is observable.
+            batch = [{'id': 1000 + i, 'title': f'Page2 {i}', 'handle': f'p2-{i}', 'vendor': 'Acme',
+                      'body_html': 'Widget description', 'images': [{'src': 'https://s.example/a.png'}],
+                      'variants': [{'id': 2000 + i, 'price': '11', 'available': True}]} for i in range(250)]
+            return httpx.Response(200, json={'products': batch})
+        if page == 3:
+            batch = [{'id': 2000 + i, 'title': f'Page3 {i}', 'handle': f'p3-{i}', 'vendor': 'Acme',
+                      'body_html': 'Widget description', 'images': [{'src': 'https://s.example/a.png'}],
+                      'variants': [{'id': 3000 + i, 'price': '12', 'available': True}]} for i in range(40)]
+            return httpx.Response(200, json={'products': batch})
+        return httpx.Response(200, json={'products': []})
+
+    client = httpx.AsyncClient
+    with patch('shopextract.extractors.shopify.httpx.AsyncClient',
+               side_effect=lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs)):
+        result = await ShopifyExtractor().extract(URL, max_products=1000)
+    assert pages_seen == [1, 2, 3]
+    assert len(result.products) == 540
+    assert result.pages_completed == 3
+    assert result.complete is True
+    assert result.completeness_reason is None
+    assert len({p['id'] for p in result.products}) == 540
+
+
 def test_read_time_upgrade_of_existing_full_and_bounded_history_is_safe(tmp_path):
     path = str(tmp_path / 'legacy.db')
     with sqlite3.connect(path) as conn:

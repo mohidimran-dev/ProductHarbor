@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ShopExtract catalog",
+  "title": "ProductHarbor catalog",
   "x-contract-version": "1.0",
   "description": "Flat object arrays or native portable arrays; extraction result envelope data.products also accepted. Categorized native record/runtime envelopes use the native category codec; see docs/cli.md. Native codecs validate complete Product fields, Decimal tags, evidence binding and policy digest.",
   "anyOf": [

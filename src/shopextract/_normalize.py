@@ -225,10 +225,17 @@ def _variants(raw, trace, *, shopify):
             price = item.money('price', '/price', stringify=not shopify, truthy=not shopify, strict=True)
             stock = _variant_stock(item, shopify=shopify)
             attributes = {}
+            featured_image = None
+            featured_image_id = None
             if shopify:
                 for i in range(1, 4):
                     if v.get(f'option{i}'):
                         attributes[f'option{i}'] = item.emit(f'attributes/option{i}', f'/option{i}', convert=str)
+                featured = v.get('featured_image')
+                if isinstance(featured, dict) and isinstance(featured.get('src'), str) and featured['src'].strip():
+                    featured_image = item.emit('featured_image', '/featured_image/src', convert=str.strip)
+                if v.get('image_id') is not None and str(v.get('image_id')).strip() not in ('', 'None'):
+                    featured_image_id = item.emit('featured_image_id', '/image_id', convert=str)
             variant = Variant(
                 variant_id=item.emit('variant_id', *(['/id'] if shopify else ['/variant_id', '/id']),
                                      default='', convert=str, truthy=not shopify),
@@ -236,7 +243,9 @@ def _variants(raw, trace, *, shopify):
                                 default='', truthy=not shopify),
                 price=price, sku=item.emit('sku', '/sku'), in_stock=stock,
                 gtin=item.emit('gtin', '/barcode', convert=_validate_gtin) if shopify else None,
-                attributes=attributes)
+                attributes=attributes,
+                featured_image=featured_image,
+                featured_image_id=featured_image_id)
         except (ValueError, TypeError, InvalidOperation) as exc:
             logger.debug('Failed to parse variant %s: %s', v.get('id', '?'), exc)
             continue

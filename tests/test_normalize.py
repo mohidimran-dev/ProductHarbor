@@ -124,6 +124,10 @@ class TestNormalizeShopify:
         assert len(product.variants) == 2
         assert product.variants[0].title == "250g"
         assert product.variants[0].price == Decimal("14.99")
+        assert product.variants[0].featured_image == "https://cdn.shopify.com/espresso-250.jpg"
+        assert product.variants[0].featured_image_id == "9001"
+        assert product.variants[1].featured_image is None
+        assert product.variants[1].featured_image_id is None
 
     def test_no_title_returns_none(self):
         raw = {"id": 1, "title": "", "variants": []}

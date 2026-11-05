@@ -10,6 +10,7 @@ from crawl4ai import AsyncWebCrawler
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
 from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
 
+from .._access import AccessBlockedError, detect_access_block_from_crawl, format_access_blocked
 from .._models import ExtractorResult
 from .._capture import capture
 from ._browser import (
@@ -74,9 +75,17 @@ class CSSExtractor:
                     )
                     try:
                         result = await crawler.arun(url=url, config=crawler_config)
+                        block = detect_access_block_from_crawl(result, url)
+                        if block is not None:
+                            return ExtractorResult(products=[], complete=False,
+                                                   error=format_access_blocked(block),
+                                                   completeness_reason='ACCESS_BLOCKED')
                         products = self._parse_extracted_content(url, result)
                         if products:
                             return ExtractorResult(products=products)
+                    except AccessBlockedError as exc:
+                        return ExtractorResult(products=[], complete=False, error=str(exc),
+                                               completeness_reason='ACCESS_BLOCKED')
                     except Exception as e:
                         logger.debug("CSS extraction at stealth level %s failed for %s: %s", level.value, url, e)
                         continue
@@ -111,6 +120,11 @@ class CSSExtractor:
             ) as crawler:
                 results = await crawler.arun_many(urls=urls, config=crawler_config, dispatcher=dispatcher)
                 for result in results:
+                    block = detect_access_block_from_crawl(result, getattr(result, 'url', '') or '')
+                    if block is not None:
+                        return ExtractorResult(products=all_products, complete=False,
+                                               error=format_access_blocked(block),
+                                               completeness_reason='ACCESS_BLOCKED')
                     if not result.success or not result.extracted_content:
                         continue
                     try:

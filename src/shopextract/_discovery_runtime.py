@@ -57,7 +57,7 @@ class DiscoveryClient:
             raise httpx.RequestError('Discovery request budget exhausted')
         self.request_count += 1
         async with self.client.stream('GET', url, follow_redirects=False,
-                headers={**(headers or {}), 'User-Agent':'ShopExtract/0.1.2'}) as response:
+                headers={**(headers or {}), 'User-Agent':'ProductHarbor/0.1.2'}) as response:
             body = bytearray()
             async for chunk in response.aiter_bytes():
                 if len(body)+len(chunk)>limit:
@@ -82,7 +82,7 @@ class DiscoveryClient:
         async with self.robot_locks.setdefault(origin, asyncio.Lock()):
             await self._load_robots(origin)
         policy = self.robots[origin]
-        allowed = policy if isinstance(policy,bool) else policy.can_fetch('ShopExtract',str(url))
+        allowed = policy if isinstance(policy,bool) else policy.can_fetch('ProductHarbor',str(url))
         if not allowed:
             # A fail-closed default is not a robots rule; report it as unavailable.
             self.note('robots_disallowed' if isinstance(policy,RobotFileParser) else 'robots_unavailable')

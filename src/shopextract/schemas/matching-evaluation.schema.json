@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ShopExtract matching-evaluation",
+  "title": "ProductHarbor matching-evaluation",
   "x-contract-version": "1.0",
   "type": "array",
   "items": {

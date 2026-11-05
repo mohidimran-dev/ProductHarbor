@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ShopExtract maintenance-profiles",
+  "title": "ProductHarbor maintenance-profiles",
   "x-contract-version": "1",
   "type": "object",
   "properties": {
