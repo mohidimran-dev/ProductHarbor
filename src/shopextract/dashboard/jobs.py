@@ -65,9 +65,13 @@ class DashboardJob:
     started_at: str | None = None
     finished_at: str | None = None
     elapsed_seconds: float = 0.0
-    discovered: int = 0
-    extracted: int = 0
-    failed: int = 0
+    # Measured counters only. Use None when not measured — never infer.
+    http_pages: int | None = None
+    discovered: int | None = None
+    extracted: int | None = None
+    failed: int | None = None
+    duplicates_merged: int | None = None
+    pending: int | None = None
     variant_count: int = 0
     image_count: int = 0
     platform: str | None = None
@@ -89,11 +93,15 @@ class DashboardJob:
     _result: Any = None
     _progress: ProgressCheckpoint | None = None
     awaiting_human: bool = False
+    media: Any = None  # optional MediaJob public snapshot helper
 
     def public(self) -> dict:
         elapsed = self.elapsed_seconds
         if self.state == 'running' and self._started_mono is not None:
             elapsed = round(time.monotonic() - self._started_mono, 2)
+        limited_run = self.mode == 'test' or (
+            'product_budget_reached' in (self.incompleteness_reasons or [])
+        )
         return {
             'job_id': self.job_id,
             'url': self.url,
@@ -108,15 +116,24 @@ class DashboardJob:
             'finished_at': self.finished_at,
             'elapsed_seconds': elapsed,
             'counts': {
+                'http_pages': self.http_pages,
                 'discovered': self.discovered,
                 'extracted': self.extracted,
                 'failed': self.failed,
+                'duplicates_merged': self.duplicates_merged,
+                'pending': self.pending,
                 'variants': self.variant_count,
                 'images': self.image_count,
             },
             'platform': self.platform,
             'outcome': self.outcome,
             'catalog_complete': self.catalog_complete,
+            'completeness_label': (
+                'confirmed complete' if self.catalog_complete is True
+                else ('incomplete / partial' if self.catalog_complete is False else 'unverified')
+            ),
+            'limited_run': limited_run,
+            'run_limit': MODE_MAX[self.mode],
             'incompleteness_reasons': list(self.incompleteness_reasons),
             'errors': list(self.errors),
             'message': self.message,
@@ -130,7 +147,20 @@ class DashboardJob:
                 'products_json': bool(self.products_path and Path(self.products_path).is_file()),
                 'report_json': bool(self.report_path and Path(self.report_path).is_file()),
                 'shopify_csv': bool(self.shopify_csv_path and Path(self.shopify_csv_path).is_file()),
+                'csv_images_zip': bool(
+                    getattr(self.media, 'zip_path', None)
+                    and Path(getattr(self.media, 'zip_path')).is_file()
+                ) if self.media is not None else False,
+                'shopify_ready_csv': bool(
+                    getattr(self.media, 'shopify_ready_csv_path', None)
+                    and Path(getattr(self.media, 'shopify_ready_csv_path')).is_file()
+                ) if self.media is not None else False,
+                'media_failure_report': bool(
+                    getattr(self.media, 'failure_report_path', None)
+                    and Path(getattr(self.media, 'failure_report_path')).is_file()
+                ) if self.media is not None else False,
             },
+            'media': self.media.public() if self.media is not None and hasattr(self.media, 'public') else None,
             'max_urls': MODE_MAX[self.mode],
         }
 
@@ -198,15 +228,16 @@ class DashboardJobManager:
         job.message = 'Continue signal sent; waiting for page re-check.'
         return job
 
-    def _progress_counts(self, job: DashboardJob) -> tuple[int, int]:
+    def _progress_counts(self, job: DashboardJob) -> tuple[int | None, int | None]:
+        """Return (discovered, extracted). Never infer discovered from URL attempts."""
         progress = job._progress
         if progress is None:
             return job.discovered, job.extracted
-        discovered = len(progress.attempted) if progress.attempted else 0
         extracted = 0
         for source in progress.sources:
             extracted = max(extracted, len(source.get('rows') or []))
-        return discovered or extracted, extracted
+        # Mid-run we only know accepted product rows; URL attempts are not discoveries.
+        return None, (extracted if extracted else None)
 
     async def _run(self, job: DashboardJob) -> None:
         from .._extract import extract
@@ -290,13 +321,17 @@ class DashboardJobManager:
     async def _poll_progress(self, job: DashboardJob) -> None:
         while job.state == 'running':
             discovered, extracted = self._progress_counts(job)
-            # Prefer live interactive counts when preview is already streaming.
+            # Prefer live interactive extracted counts when preview is streaming.
+            # Do not invent discovered from preview length or URL attempts.
             if job.preview:
-                job.extracted = max(extracted, len(job.preview))
-                job.discovered = max(discovered, job.extracted)
-            else:
-                job.discovered = discovered
+                job.extracted = len(job.preview)
+            elif extracted is not None:
                 job.extracted = extracted
+            if discovered is not None:
+                job.discovered = discovered
+            limit = MODE_MAX[job.mode]
+            if job.extracted is not None and job.state == 'running':
+                job.pending = max(0, limit - job.extracted)
             await asyncio.sleep(0.4)
 
     def _on_live_product(self, job: DashboardJob, record: dict) -> None:
@@ -311,7 +346,8 @@ class DashboardJobManager:
         }
         job.preview = list(job.preview) + [row]
         job.extracted = len(job.preview)
-        job.discovered = max(job.discovered, job.extracted)
+        # Discovered stays null until finalize reports a measured discovery count.
+        job.pending = max(0, MODE_MAX[job.mode] - job.extracted)
         job.variant_count = sum(int(item.get('variant_count') or 0) for item in job.preview)
         job.image_count = sum(1 for item in job.preview if item.get('image_url'))
         job.message = f'Live preview: extracted {job.extracted} product(s)…'
@@ -331,9 +367,13 @@ class DashboardJobManager:
         job.catalog_complete = result.catalog_complete
         job.incompleteness_reasons = list(result.incompleteness_reasons)
         job.errors = list(result.errors)
+        # Measured counters only — never infer discovered/failed from urls_attempted.
         job.extracted = result.product_count
-        job.discovered = max(result.urls_attempted, result.product_count)
-        job.failed = max(0, job.discovered - job.extracted) if result.urls_attempted else 0
+        job.http_pages = getattr(result, 'http_pages', None)
+        job.discovered = getattr(result, 'products_discovered', None)
+        job.failed = getattr(result, 'products_failed', None)
+        job.duplicates_merged = getattr(result, 'duplicates_merged', None)
+        job.pending = 0
         job.variant_count = sum(len(p.variants or []) for p in result.products)
         job.image_count = sum(
             (1 if p.image_url else 0) + len(p.additional_images or []) for p in result.products
@@ -347,26 +387,45 @@ class DashboardJobManager:
             incompleteness_reasons=result.incompleteness_reasons,
         )
         job.outcome = outcome
+        limited = job.mode == 'test' or 'product_budget_reached' in job.incompleteness_reasons
         if blocked is not None:
             job.state = 'blocked'
             job.message = blocked if blocked != ACCESS_BLOCKED else (
                 f'{ACCESS_BLOCKED} url={job.url} status=unknown reason=access_blocked'
             )
             return
-        if outcome == 'complete':
+        if outcome == 'complete' and result.catalog_complete is True:
             job.state = 'succeeded'
             job.message = 'Collection extraction completed with confirmed completeness evidence.'
             self._write_exports(job, result)
             return
         if result.product_count > 0:
             job.state = 'partial'
-            job.message = 'Partial results retained; completeness not confirmed.'
+            if limited:
+                job.message = (
+                    f'Limited/partial run (cap {MODE_MAX[job.mode]}). '
+                    'Completeness not confirmed for the full collection.'
+                )
+            else:
+                job.message = 'Partial results retained; completeness not confirmed.'
             self._write_exports(job, result)
             return
         job.state = 'failed'
         job.message = 'No usable products were extracted; source failed or was incomplete.'
 
     def _write_exports(self, job: DashboardJob, result) -> None:
+        from .._dedupe import dedupe_products
+        products, dedupe_stats = dedupe_products(list(result.products), store=job.url)
+        result.products = products
+        prior_dupes = job.duplicates_merged or 0
+        job.duplicates_merged = prior_dupes + dedupe_stats.duplicate_product_observations_merged
+        job.extracted = len(products)
+        job.variant_count = sum(len(p.variants or []) for p in products)
+        job.image_count = sum(
+            (1 if p.image_url else 0) + len(p.additional_images or []) for p in products
+        )
+        job.preview = preview_products(products)
+
         directory = self.export_root / job.job_id
         directory.mkdir(parents=True, exist_ok=True)
         products_path = directory / 'products.json'
@@ -377,12 +436,14 @@ class DashboardJobManager:
             'tab': job.tab,
             'mode': job.mode,
             'extracted_at': job.finished_at or _utc_now(),
-            'product_count': result.product_count,
+            'product_count': len(products),
+            'dedupe': dedupe_stats.as_dict(),
             'products': [
                 {
                     'external_id': p.external_id or None,
                     'title': p.title or None,
                     'description': p.description or None,
+                    'description_html': getattr(p, 'description_html', '') or None,
                     'price': _money(p.price),
                     'compare_at_price': _money(p.compare_at_price),
                     'currency': p.currency or None,
@@ -390,6 +451,7 @@ class DashboardJobManager:
                     'image_url': p.image_url or None,
                     'additional_images': list(p.additional_images or []),
                     'product_url': p.product_url or None,
+                    'option_names': list(getattr(p, 'option_names', None) or []),
                     'variants': [
                         {
                             'variant_id': v.variant_id or None,
@@ -403,7 +465,7 @@ class DashboardJobManager:
                         for v in (p.variants or [])
                     ],
                 }
-                for p in result.products
+                for p in products
             ],
         }
         report_payload = {
@@ -415,16 +477,21 @@ class DashboardJobManager:
             'state': job.state,
             'outcome': job.outcome,
             'catalog_complete': job.catalog_complete,
+            'limited_run': job.mode == 'test' or 'product_budget_reached' in job.incompleteness_reasons,
             'incompleteness_reasons': job.incompleteness_reasons,
             'errors': job.errors,
             'message': job.message,
             'counts': {
+                'http_pages': job.http_pages,
                 'discovered': job.discovered,
                 'extracted': job.extracted,
                 'failed': job.failed,
+                'duplicates_merged': job.duplicates_merged,
+                'pending': job.pending,
                 'variants': job.variant_count,
                 'images': job.image_count,
             },
+            'dedupe': dedupe_stats.as_dict(),
             'elapsed_seconds': job.elapsed_seconds,
             'pipeline': data,
         }
@@ -433,7 +500,7 @@ class DashboardJobManager:
         self._atomic_write(report_path, report_payload)
         from .shopify_csv import write_shopify_csv
         shopify_path = directory / 'products-shopify.csv'
-        write_shopify_csv(result.products, shopify_path)
+        write_shopify_csv(products, shopify_path)
         job.products_path = str(products_path)
         job.report_path = str(report_path)
         job.shopify_csv_path = str(shopify_path)

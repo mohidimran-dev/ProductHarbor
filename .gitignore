@@ -60,6 +60,8 @@ Thumbs.db
 
 # Local runtime artifacts (do not publish)
 artifacts/
+# Explicit: Shopify Admin tokens for Product Harbor (also under artifacts/)
+**/secrets/
 **/browser-profiles/
 *.local.json
 lv-handbags-test.json

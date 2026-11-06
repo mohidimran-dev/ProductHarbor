@@ -177,15 +177,37 @@ def product_from_record(record: dict) -> Product:
             raise ValueError("Unsupported portable record version")
         data = decode_value(record["product"])
         validate_tree(data)
-        if not isinstance(data, dict) or set(data) != {f.name for f in fields(Product)}:
-            raise ValueError("Portable product requires exactly the Product fields")
+        expected_product = {f.name for f in fields(Product)}
+        if not isinstance(data, dict) or set(data) - expected_product:
+            raise ValueError("Portable product requires Product fields (unknown keys rejected)")
+        # Older checkpoints may omit newly added optional fields; fill defaults.
+        from dataclasses import MISSING
+        for field_info in fields(Product):
+            if field_info.name in data:
+                continue
+            if field_info.default_factory is not MISSING:
+                data[field_info.name] = field_info.default_factory()
+            elif field_info.default is not MISSING:
+                data[field_info.name] = field_info.default
+            else:
+                raise ValueError(f"Portable product missing required field {field_info.name}")
         data["platform"] = Platform(data["platform"])
         if not isinstance(data["variants"], list):
             raise ValueError("variants must be a list")
         variants = []
+        expected_variant = {f.name for f in fields(Variant)}
         for item in data["variants"]:
-            if not isinstance(item, dict) or set(item) != {f.name for f in fields(Variant)}:
-                raise ValueError("Portable variant requires exactly the Variant fields")
+            if not isinstance(item, dict) or set(item) - expected_variant:
+                raise ValueError("Portable variant requires Variant fields (unknown keys rejected)")
+            for field_info in fields(Variant):
+                if field_info.name in item:
+                    continue
+                if field_info.default_factory is not MISSING:
+                    item[field_info.name] = field_info.default_factory()
+                elif field_info.default is not MISSING:
+                    item[field_info.name] = field_info.default
+                else:
+                    raise ValueError(f"Portable variant missing required field {field_info.name}")
             variants.append(Variant(**item))
         data["variants"] = variants
         product = Product(**data)

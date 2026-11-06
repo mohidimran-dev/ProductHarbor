@@ -118,7 +118,14 @@ class ShopifyExtractor:
                             product['_shop_currency']=shop_currency
                             product.setdefault('_field_sources',{})['/_shop_currency']={'capture_path':'/cart_currency','_capture':currency_capture}
 
-                    all_products.extend(products[:remaining])
+                    # Merge page observations by product id so pagination/resume cannot duplicate.
+                    from .._dedupe import dedupe_product_dicts
+                    combined = all_products + products[:remaining]
+                    all_products[:], _ = dedupe_product_dicts(
+                        combined, store=base_url, platform='shopify',
+                    )
+                    if max_products is not None and len(all_products) > max_products:
+                        del all_products[max_products:]
                     if max_products is not None and len(all_products) >= max_products:
                         # A short final page proves exhaustion only if no records
                         # were discarded. An exactly full page cannot prove it.

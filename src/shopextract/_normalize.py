@@ -125,6 +125,7 @@ def normalize(
             external_id=normalized_data.get("external_id", ""),
             title=normalized_data.get("title", ""),
             description=normalized_data.get("description", ""),
+            description_html=normalized_data.get("description_html", "") or "",
             price=normalized_data.get("price", Decimal("0")),
             compare_at_price=normalized_data.get("compare_at_price"),
             currency=normalized_data.get("currency", "USD"),
@@ -141,6 +142,7 @@ def normalize(
             tags=normalized_data.get("tags", []),
             additional_images=normalized_data.get("additional_images", []),
             category_path=normalized_data.get("category_path", []),
+            option_names=list(normalized_data.get("option_names") or []),
             platform=platform,
             raw_data=raw,
         )
@@ -215,8 +217,51 @@ def _variant_stock(trace, *, shopify):
                       operation='Convert explicit Shopware in_stock to boolean')
 
 
-def _variants(raw, trace, *, shopify):
+def _shopify_option_names(raw: dict) -> list[str]:
+    """Preserve Shopify options[].name in source position order. No invented labels."""
+    names: list[str] = []
+    for entry in raw.get('options') or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get('name')
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+        else:
+            names.append('')
+    return names
+
+
+def _variant_option_attributes(variant_raw: dict, item, option_names: list[str]) -> dict:
+    """Map option1..option3 values onto source labels when present; never invent names.
+
+    Duplicate source labels keep both values: first uses the label; later positions
+    keep a distinct positional key so values are not overwritten.
+    """
+    attributes: dict[str, str] = {}
+    used_labels: set[str] = set()
+    for index in range(1, 4):
+        raw_value = variant_raw.get(f'option{index}')
+        if raw_value in (None, ''):
+            continue
+        value = item.emit(f'attributes/option{index}', f'/option{index}', convert=str)
+        label = ''
+        if index - 1 < len(option_names):
+            label = option_names[index - 1]
+        if label and label not in used_labels:
+            attributes[label] = value
+            used_labels.add(label)
+        elif label and label in used_labels:
+            # Preserve the value under a non-colliding positional key; do not invent a retail label.
+            attributes[f'option{index}'] = value
+        else:
+            # Source supplied no label for this position — keep positional key, not a guessed name.
+            attributes[f'option{index}'] = value
+    return attributes
+
+
+def _variants(raw, trace, *, shopify, option_names: list[str] | None = None):
     variants = []
+    labels = option_names if option_names is not None else (_shopify_option_names(raw) if shopify else [])
     for source_index, v in enumerate(raw.get('variants') or []):
         if not isinstance(v, dict):
             continue
@@ -228,9 +273,7 @@ def _variants(raw, trace, *, shopify):
             featured_image = None
             featured_image_id = None
             if shopify:
-                for i in range(1, 4):
-                    if v.get(f'option{i}'):
-                        attributes[f'option{i}'] = item.emit(f'attributes/option{i}', f'/option{i}', convert=str)
+                attributes = _variant_option_attributes(v, item, labels)
                 featured = v.get('featured_image')
                 if isinstance(featured, dict) and isinstance(featured.get('src'), str) and featured['src'].strip():
                     featured_image = item.emit('featured_image', '/featured_image/src', convert=str.strip)
@@ -278,10 +321,12 @@ def _normalize_shopify(raw: dict, shop_url: str) -> dict | None:
     parsed_tags = [tag.strip() for tag in tags.split(',') if tag.strip()] if isinstance(tags, str) else list(tags) if tags else []
     tag_paths = ['/tags']*len(parsed_tags) if isinstance(tags, str) else [f'/tags/{i}' for i in range(len(parsed_tags))]
     category = [raw['product_type']] if raw.get('product_type') else []
+    option_names = _shopify_option_names(raw)
     return t.result({
         'external_id': t.emit('external_id', '/id', default='', convert=str),
         'title': title,
         'description': t.emit('description', '/body_html', default='', convert=_strip_html, operation='Strip HTML, decode entities and whitespace'),
+        'description_html': t.emit('description_html', '/body_html', default='', convert=lambda value: value if isinstance(value, str) else '', operation='Retain original body_html'),
         'price': t.money('price', '/variants/0/price'),
         'compare_at_price': t.money('compare_at_price', '/variants/0/compare_at_price', default=None, truthy=True),
         'currency': t.currency('currency', '/variants/0/price_currency', '/currency', '/_shop_currency'),
@@ -293,7 +338,8 @@ def _normalize_shopify(raw: dict, shop_url: str) -> dict | None:
         'vendor': t.emit('vendor', '/vendor'),
         'product_type': t.emit('product_type', '/product_type'),
         'in_stock': stock,
-        'variants': _variants(raw, t, shopify=True),
+        'option_names': option_names,
+        'variants': _variants(raw, t, shopify=True, option_names=option_names),
         'tags': _record_items(t, 'tags', '/tags', parsed_tags, tag_paths, 'Parse/trim tags'),
         'additional_images': _record_items(t, 'additional_images', '/images', additional, image_paths, 'Project remaining image URLs'),
         'category_path': _record_items(t, 'category_path', '/product_type', category, ['/product_type']*len(category), 'Project product category'),

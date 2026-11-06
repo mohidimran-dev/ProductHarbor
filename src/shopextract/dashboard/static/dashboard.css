@@ -551,6 +551,42 @@ body {
   flex-wrap: wrap;
 }
 
+.shopify-conn {
+  margin: 0 0 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.shopify-conn .label {
+  margin: 0;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.shopify-conn .value {
+  margin: 0.25rem 0 0.4rem;
+  font-family: var(--display);
+  font-weight: 600;
+}
+
+.shopify-form {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.media-counts {
+  margin: 0.75rem 0 1rem;
+}
+
+.media-actions {
+  margin-top: 0.35rem;
+}
+
 .download {
   text-decoration: none;
   display: inline-flex;

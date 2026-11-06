@@ -134,15 +134,45 @@ def test_checkpoint_reuses_codec_budget_boundaries(dimension,delta):
  from shopextract._portable import product_to_record
  from shopextract.export._bundle import _json_bytes
  from shopextract._bounded_json import preflight_catalog_json
- product=Product(title='Accepted',external_id='P1',price=Decimal('10'))
- payload=_json_bytes(product_to_record(product));shape=preflight_catalog_json(payload)
+ # Distinct identities: codec budget tests must not rely on same-ID duplicates
+ # (product dedupe correctly merges identical source IDs into one product).
+ products=[Product(title='Accepted',external_id=f'P{i+1}',price=Decimal('10')) for i in range(2)]
+ payload=_json_bytes(product_to_record(products[0]));shape=preflight_catalog_json(payload)
  count=2 if dimension=='nodes' else 1
  value=len(payload) if dimension=='bytes' else shape.nodes*2 if dimension=='nodes' else shape.depth
  checkpoint=ProgressCheckpoint(**{'max_'+dimension:value+delta})
- checkpoint.register_source([product]*count,Platform.GENERIC,URL,normalized=True)
+ checkpoint.register_source(products[:count],Platform.GENERIC,URL,normalized=True)
  result=checkpoint.snapshot()
  assert (len(result.products) if result else 0)==(count if delta==0 else count-1)
  if result and delta<0:assert 'checkpoint_budget_reached' in result.incompleteness_reasons
+
+
+def test_checkpoint_same_id_observations_merge_after_budget_accept():
+ from shopextract._execution import ProgressCheckpoint
+ from shopextract._models import Product,Platform
+ duplicate=[Product(title='Same',external_id='SAME',price=Decimal('10'),image_url='https://cdn.example/a.png'),
+            Product(title='Same refreshed',external_id='SAME',price=Decimal('11'),additional_images=['https://cdn.example/b.png'])]
+ checkpoint=ProgressCheckpoint()
+ checkpoint.register_source(duplicate,Platform.GENERIC,URL,normalized=True)
+ result=checkpoint.snapshot()
+ assert result is not None
+ assert len(result.products)==1
+ assert result.products[0].title=='Same refreshed'
+ assert result.products[0].image_url=='https://cdn.example/a.png'
+ assert 'https://cdn.example/b.png' in result.products[0].additional_images
+
+
+def test_checkpoint_distinct_ids_retained_after_round_trip():
+ from shopextract._execution import ProgressCheckpoint
+ from shopextract._models import Product,Platform
+ from shopextract._portable import product_from_record,product_to_record
+ rows=[Product(title=f'Item {i}',external_id=str(i),price=Decimal('10')) for i in range(3)]
+ checkpoint=ProgressCheckpoint()
+ checkpoint.register_source(rows,Platform.GENERIC,URL,normalized=True)
+ result=checkpoint.snapshot()
+ assert result is not None and len(result.products)==3
+ revived=[product_from_record(product_to_record(p)) for p in result.products]
+ assert {p.external_id for p in revived}=={'0','1','2'}
 
 @pytest.mark.parametrize('restore',[False,True])
 def test_timeout_restore_short_gtin_matches_normal_completion(monkeypatch,restore):

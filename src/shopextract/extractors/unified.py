@@ -12,7 +12,6 @@ with both price and image, returns immediately (no browser).
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from urllib.parse import urljoin
@@ -453,24 +452,12 @@ def _has_product_signal(product: dict, og: dict) -> bool:
 
 
 def _deduplicate_products(products: list[dict]) -> list[dict]:
+    """Dedupe by platform/store ID or canonical URL — never title/price alone."""
     if len(products) <= 1:
         return products
-
-    seen: dict[str, dict] = {}
-    for product in products:
-        name = (product.get("name") or product.get("og:title") or "").strip().lower()
-        price = str(_get_price(product) or "")
-        sku = str(product.get("sku") or product.get("productID") or "")
-        key = hashlib.md5(f"{name}:{price}:{sku}".encode()).hexdigest()
-
-        if key in seen:
-            existing = seen[key]
-            if sum(1 for v in product.values() if v) > sum(1 for v in existing.values() if v):
-                seen[key] = product
-        else:
-            seen[key] = product
-
-    return list(seen.values())
+    from .._dedupe import dedupe_product_dicts
+    deduped, _stats = dedupe_product_dicts(products, store='', platform='generic')
+    return deduped
 
 
 def _merge_og(og_from_meta: list[dict], og_from_html: list[dict]) -> dict:

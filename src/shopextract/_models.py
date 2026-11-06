@@ -65,6 +65,8 @@ class Product:
     price: Decimal = Decimal("0")
     currency: str = "USD"
     description: str = ""
+    # Original source HTML when available (e.g. Shopify body_html). Plain text stays in description.
+    description_html: str = ""
     image_url: str = ""
     product_url: str = ""
     external_id: str = ""
@@ -80,6 +82,8 @@ class Product:
     tags: list[str] = field(default_factory=list)
     additional_images: list[str] = field(default_factory=list)
     category_path: list[str] = field(default_factory=list)
+    # Ordered option labels from source (Shopify options[].name). Empty when not supplied.
+    option_names: list[str] = field(default_factory=list)
     platform: Platform = Platform.GENERIC
     scraped_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw_data: dict = field(default_factory=dict)
@@ -138,6 +142,11 @@ class ExtractionResult:
     catalog_complete: bool | None = None
     observation_scope: str = ""
     incompleteness_reasons: list[str] = field(default_factory=list)
+    # Optional measured counters (None = not measured; never infer).
+    http_pages: int | None = None
+    products_discovered: int | None = None
+    products_failed: int | None = None
+    duplicates_merged: int | None = None
 
     @property
     def outcome(self) -> str:

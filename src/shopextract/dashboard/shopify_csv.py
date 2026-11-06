@@ -90,14 +90,29 @@ def _money(value) -> str:
     return str(value)
 
 
-def _option_pairs(attributes: dict | None) -> list[tuple[str, str]]:
+def _option_pairs(attributes: dict | None, *, preferred_names: list[str] | None = None) -> list[tuple[str, str]]:
+    """Build up to 3 option pairs. Prefer source option_names order when values exist."""
     if not attributes:
         return []
-    pairs = []
-    for key, value in attributes.items():
+    pairs: list[tuple[str, str]] = []
+    used_keys: set[str] = set()
+    # Prefer ordered source labels when the variant carries those keys.
+    for name in preferred_names or []:
+        if not name or name not in attributes:
+            continue
+        value = attributes.get(name)
         if value is None or value == '':
             continue
-        pairs.append((str(key), str(value)))
+        pairs.append((str(name), str(value)))
+        used_keys.add(name)
+        if len(pairs) >= 3:
+            return pairs
+    for key, value in attributes.items():
+        if key in used_keys or value is None or value == '':
+            continue
+        # Positional fallback keys are exported with blank name only when no source label exists.
+        label = '' if str(key).startswith('option') and str(key)[6:].isdigit() else str(key)
+        pairs.append((label, str(value)))
         if len(pairs) >= 3:
             break
     return pairs
@@ -111,7 +126,10 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
     for index, product in enumerate(products, start=1):
         if isinstance(product, dict):
             title = str(product.get('title') or '').strip()
-            description = str(product.get('description') or '')
+            description_html = product.get('description_html') if isinstance(product.get('description_html'), str) else ''
+            description_text = str(product.get('description') or '')
+            # Shopify Body (HTML) prefers retained source HTML; fall back to plain text.
+            description = description_html or description_text
             price = _money(product.get('price'))
             compare = _money(product.get('compare_at_price'))
             sku = product.get('sku') if isinstance(product.get('sku'), str) else ''
@@ -120,9 +138,12 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
             variants = product.get('variants') or []
             vendor = product.get('vendor') if isinstance(product.get('vendor'), str) else ''
             product_type = product.get('product_type') if isinstance(product.get('product_type'), str) else ''
+            option_names = [n for n in (product.get('option_names') or []) if isinstance(n, str)]
         else:
             title = str(getattr(product, 'title', '') or '').strip()
-            description = str(getattr(product, 'description', '') or '')
+            description_html = str(getattr(product, 'description_html', '') or '')
+            description_text = str(getattr(product, 'description', '') or '')
+            description = description_html or description_text
             price = _money(getattr(product, 'price', None))
             compare = _money(getattr(product, 'compare_at_price', None))
             sku = getattr(product, 'sku', None) if isinstance(getattr(product, 'sku', None), str) else ''
@@ -131,6 +152,7 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
             variants = list(getattr(product, 'variants', None) or [])
             vendor = getattr(product, 'vendor', None) if isinstance(getattr(product, 'vendor', None), str) else ''
             product_type = getattr(product, 'product_type', None) if isinstance(getattr(product, 'product_type', None), str) else ''
+            option_names = [n for n in (getattr(product, 'option_names', None) or []) if isinstance(n, str)]
 
         if not title:
             continue
@@ -151,13 +173,13 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
                     v_sku = variant.get('sku') if isinstance(variant.get('sku'), str) else ''
                     v_price = _money(variant.get('price')) or price
                     v_image = variant.get('featured_image') if isinstance(variant.get('featured_image'), str) else ''
-                    options = _option_pairs(variant.get('options') or variant.get('attributes'))
+                    options = _option_pairs(variant.get('options') or variant.get('attributes'), preferred_names=option_names)
                 else:
                     v_title = str(getattr(variant, 'title', '') or '')
                     v_sku = getattr(variant, 'sku', None) if isinstance(getattr(variant, 'sku', None), str) else ''
                     v_price = _money(getattr(variant, 'price', None)) or price
                     v_image = getattr(variant, 'featured_image', None) if isinstance(getattr(variant, 'featured_image', None), str) else ''
-                    options = _option_pairs(getattr(variant, 'attributes', None))
+                    options = _option_pairs(getattr(variant, 'attributes', None), preferred_names=option_names)
                 if not options and v_title:
                     options = [('Title', v_title)]
                 variant_rows.append({
@@ -196,8 +218,12 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
                     row['Image position'] = '1'
                     row['Image alt text'] = title
                 row['SEO title'] = title
-                if description:
-                    row['SEO description'] = description[:320]
+                if description_text:
+                    row['SEO description'] = description_text[:320]
+                elif description:
+                    # Strip tags lightly for SEO when only HTML was retained.
+                    import re
+                    row['SEO description'] = re.sub(r'<[^>]+>', ' ', description)[:320].strip()
             row['SKU'] = variant['sku'] or ''
             row['Price'] = variant['price'] or ''
             row['Compare-at price'] = variant['compare'] or ''
@@ -219,10 +245,29 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
     return rows
 
 
-def write_shopify_csv(products: Iterable, path: Path) -> Path:
+def assert_shopify_image_urls_safe(rows: Iterable[dict[str, str]]) -> None:
+    """Reject local/file/base64 values that Shopify native CSV cannot import."""
+    forbidden_prefixes = ('file:', 'data:', 'blob:', '/', '\\\\', 'c:\\', 'c:/')
+    for row in rows:
+        for key in ('Product image URL', 'Variant image URL'):
+            value = (row.get(key) or '').strip()
+            if not value:
+                continue
+            lower = value.lower()
+            if any(lower.startswith(prefix) for prefix in forbidden_prefixes):
+                raise ValueError(f'Shopify image column must be an HTTPS URL, not local/data: {key}')
+            if 'localhost' in lower or '127.0.0.1' in lower:
+                raise ValueError(f'Shopify image column must not use localhost: {key}')
+            if not lower.startswith('https://') and not lower.startswith('http://'):
+                raise ValueError(f'Shopify image column must be an HTTP(S) URL: {key}')
+
+
+def write_shopify_csv(products: Iterable, path: Path, *, validate_image_urls: bool = True) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = products_to_shopify_rows(products)
+    if validate_image_urls:
+        assert_shopify_image_urls_safe(rows)
     temporary = path.with_suffix(path.suffix + '.tmp')
     with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=SHOPIFY_PRODUCT_HEADERS, extrasaction='ignore')

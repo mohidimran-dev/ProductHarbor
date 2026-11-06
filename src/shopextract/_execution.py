@@ -105,6 +105,8 @@ class ProgressCheckpoint:
                     limited=True
             if not payloads:continue
             products=[product_from_record(json.loads(payload)) for payload in payloads]
+            from ._dedupe import dedupe_products
+            products,_=dedupe_products(products,store=self.shop_url or source['shop_url'] or '')
             platform=self.result_platform or source['platform'];tier=source['tier']
             raw=[p.raw_data for p in products]
             attempted=1 if tier==ExtractionTier.API else max(1,len(self.attempted))

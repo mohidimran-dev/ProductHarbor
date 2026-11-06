@@ -1,6 +1,6 @@
 (() => {
   const NOTES = {
-    auto: 'Auto Detect finds the platform, then routes to the matching ProductHarbor extractor.',
+    auto: 'Auto Detect finds the platform, then routes to the matching Product Harbor extractor.',
     shopify: 'Shopify uses the public products.json / collection API path.',
     woocommerce: 'WooCommerce uses the Store API extractor.',
     custom: 'Custom / Other uses the generic crawl path with browser support. Enable interactive headed browser for protected storefronts.',
@@ -19,10 +19,14 @@
     elapsed: document.getElementById('elapsed'),
     platform: document.getElementById('platform'),
     completeness: document.getElementById('completeness'),
+    httpPages: document.getElementById('http-pages'),
     discovered: document.getElementById('discovered'),
     extracted: document.getElementById('extracted'),
     failed: document.getElementById('failed'),
+    duplicates: document.getElementById('duplicates'),
+    pending: document.getElementById('pending'),
     variants: document.getElementById('variants'),
+    runLimitNote: document.getElementById('run-limit-note'),
     message: document.getElementById('message'),
     reasons: document.getElementById('reasons'),
     preview: document.getElementById('preview'),
@@ -33,13 +37,33 @@
     liveLabel: document.getElementById('live-label'),
     liveImage: document.getElementById('live-image'),
     liveEmpty: document.getElementById('live-empty'),
+    shopifyStatus: document.getElementById('shopify-status'),
+    shopifyHint: document.getElementById('shopify-hint'),
+    shopifyForm: document.getElementById('shopify-connect-form'),
+    shopifyShop: document.getElementById('shopify-shop'),
+    shopifyToken: document.getElementById('shopify-token'),
+    shopifySave: document.getElementById('shopify-save'),
+    shopifyDisconnect: document.getElementById('shopify-disconnect'),
+    mediaZip: document.getElementById('media-zip'),
+    mediaShopify: document.getElementById('media-shopify'),
+    mediaCancel: document.getElementById('media-cancel'),
+    mediaResume: document.getElementById('media-resume'),
+    mediaMessage: document.getElementById('media-message'),
+    mediaTotal: document.getElementById('media-total'),
+    mediaDownloaded: document.getElementById('media-downloaded'),
+    mediaUploaded: document.getElementById('media-uploaded'),
+    mediaFailed: document.getElementById('media-failed'),
+    downloadZip: document.getElementById('download-zip'),
+    downloadShopifyReady: document.getElementById('download-shopify-ready'),
+    downloadMediaFailure: document.getElementById('download-media-failure'),
   };
 
   let lastLiveStamp = null;
-
   let activeTab = 'auto';
   let jobId = null;
   let pollTimer = null;
+  let shopifyConnected = false;
+  let lastMediaKind = null;
 
   function selectedMode() {
     return document.querySelector('input[name="mode"]:checked')?.value || 'test';
@@ -56,6 +80,74 @@
     if (!show) els.interactive.checked = false;
   }
 
+  function setDownload(el, enabled, href) {
+    el.classList.toggle('disabled', !enabled);
+    el.href = enabled ? href : '#';
+  }
+
+  function renderShopify(status) {
+    shopifyConnected = Boolean(status?.connected);
+    if (shopifyConnected) {
+      els.shopifyStatus.textContent = `Connected · ${status.shop}`;
+      els.shopifyHint.textContent = `Destination store for Product Harbor media uploads: ${status.shop}. Scopes: ${(status.required_scopes || []).join(', ')}.`;
+      els.shopifyForm.classList.add('hidden');
+      els.shopifyDisconnect.classList.remove('hidden');
+      els.shopifyToken.value = '';
+    } else {
+      els.shopifyStatus.textContent = 'Not connected';
+      els.shopifyHint.textContent = status?.setup_hint || 'Connect a store to prepare Shopify-ready CSV with CDN URLs.';
+      els.shopifyForm.classList.remove('hidden');
+      els.shopifyDisconnect.classList.add('hidden');
+    }
+  }
+
+  async function refreshShopify() {
+    try {
+      const response = await fetch('/api/shopify/status');
+      const payload = await response.json();
+      if (payload.ok) renderShopify(payload.shopify);
+    } catch (error) {
+      els.shopifyStatus.textContent = 'Status unavailable';
+      els.shopifyHint.textContent = error.message;
+    }
+  }
+
+  function renderMedia(job) {
+    const hasProducts = Boolean(job?.downloads?.products_json);
+    const media = job?.media;
+    const mediaRunning = media && media.state === 'running';
+    const canStart = hasProducts && !mediaRunning && ['succeeded', 'partial'].includes(job?.state);
+    els.mediaZip.disabled = !canStart;
+    els.mediaShopify.disabled = !canStart || !shopifyConnected;
+    els.mediaCancel.disabled = !mediaRunning;
+    els.mediaResume.disabled = !(media && media.resumable && !mediaRunning);
+
+    if (!hasProducts) {
+      els.mediaMessage.textContent = 'Run an extraction with products first.';
+    } else if (media) {
+      const dest = media.shop ? ` → ${media.shop}` : '';
+      els.mediaMessage.textContent = `${media.message || media.state}${dest}`;
+      lastMediaKind = media.kind || lastMediaKind;
+    } else {
+      els.mediaMessage.textContent = shopifyConnected
+        ? 'Ready. Download a backup ZIP, or prepare a Shopify-ready CSV (uploads images to your store Files library).'
+        : 'Ready for ZIP backup. Connect Shopify to prepare a CDN-mapped CSV.';
+    }
+
+    const download = media?.download || {};
+    const upload = media?.upload || {};
+    els.mediaTotal.textContent = String(download.total ?? 0);
+    els.mediaDownloaded.textContent = String(download.downloaded ?? 0);
+    els.mediaUploaded.textContent = String(upload.uploaded ?? 0);
+    const failed = Number(download.failed || 0) + Number(upload.failed || 0);
+    els.mediaFailed.textContent = String(failed);
+
+    const id = job?.job_id;
+    setDownload(els.downloadZip, Boolean(job?.downloads?.csv_images_zip || media?.downloads?.csv_images_zip), id ? `/api/jobs/${id}/download/csv_images_zip` : '#');
+    setDownload(els.downloadShopifyReady, Boolean(job?.downloads?.shopify_ready_csv || media?.downloads?.shopify_ready_csv), id ? `/api/jobs/${id}/download/shopify_ready` : '#');
+    setDownload(els.downloadMediaFailure, Boolean(job?.downloads?.media_failure_report || media?.downloads?.failure_report), id ? `/api/jobs/${id}/download/media_failure_report` : '#');
+  }
+
   function renderJob(job) {
     if (!job) return;
     els.state.textContent = job.state;
@@ -65,10 +157,15 @@
     if (job.catalog_complete === true) els.completeness.textContent = 'confirmed complete';
     else if (job.catalog_complete === false) els.completeness.textContent = 'incomplete / partial';
     else els.completeness.textContent = 'unverified';
-    els.discovered.textContent = String(job.counts?.discovered ?? 0);
-    els.extracted.textContent = String(job.counts?.extracted ?? 0);
-    els.failed.textContent = String(job.counts?.failed ?? 0);
+    const fmt = (value) => (value === null || value === undefined ? '—' : String(value));
+    els.httpPages.textContent = fmt(job.counts?.http_pages);
+    els.discovered.textContent = fmt(job.counts?.discovered);
+    els.extracted.textContent = fmt(job.counts?.extracted);
+    els.failed.textContent = fmt(job.counts?.failed);
+    els.duplicates.textContent = fmt(job.counts?.duplicates_merged);
+    els.pending.textContent = fmt(job.counts?.pending);
     els.variants.textContent = String(job.counts?.variants ?? 0);
+    els.runLimitNote?.classList.toggle('hidden', !job.limited_run);
     els.message.textContent = job.message || '';
     els.continueBtn.disabled = !(job.state === 'running' && job.interactive_browser);
     els.reasons.innerHTML = '';
@@ -83,15 +180,9 @@
       els.reasons.appendChild(li);
     }
 
-    const canProducts = Boolean(job.downloads?.products_json);
-    const canReport = Boolean(job.downloads?.report_json);
-    const canShopify = Boolean(job.downloads?.shopify_csv);
-    els.downloadProducts.classList.toggle('disabled', !canProducts);
-    els.downloadReport.classList.toggle('disabled', !canReport);
-    els.downloadShopify.classList.toggle('disabled', !canShopify);
-    els.downloadProducts.href = canProducts ? `/api/jobs/${job.job_id}/download/products` : '#';
-    els.downloadReport.href = canReport ? `/api/jobs/${job.job_id}/download/report` : '#';
-    els.downloadShopify.href = canShopify ? `/api/jobs/${job.job_id}/download/shopify` : '#';
+    setDownload(els.downloadProducts, Boolean(job.downloads?.products_json), `/api/jobs/${job.job_id}/download/products`);
+    setDownload(els.downloadReport, Boolean(job.downloads?.report_json), `/api/jobs/${job.job_id}/download/report`);
+    setDownload(els.downloadShopify, Boolean(job.downloads?.shopify_csv), `/api/jobs/${job.job_id}/download/shopify`);
 
     const showLive = Boolean(job.interactive_browser);
     els.livePanel.classList.toggle('hidden', !showLive);
@@ -116,6 +207,8 @@
           : 'No browser snapshot captured.';
       }
     }
+
+    renderMedia(job);
 
     const preview = job.preview || [];
     if (!preview.length) {
@@ -163,14 +256,50 @@
         return;
       }
       renderJob(payload.job);
+      const mediaRunning = payload.job.media && payload.job.media.state === 'running';
       const terminal = ['succeeded', 'failed', 'cancelled', 'blocked', 'partial'].includes(payload.job.state);
-      if (terminal) {
+      if (terminal && !mediaRunning) {
         clearInterval(pollTimer);
         pollTimer = null;
         setBusy(false);
+      } else if (mediaRunning && !pollTimer) {
+        pollTimer = setInterval(poll, 700);
       }
     } catch (error) {
       els.message.textContent = `Status poll failed: ${error.message}`;
+    }
+  }
+
+  function ensurePolling() {
+    if (!pollTimer) pollTimer = setInterval(poll, 700);
+  }
+
+  async function startMedia(kind, resume = false) {
+    if (!jobId) return;
+    lastMediaKind = kind;
+    els.mediaMessage.textContent = kind === 'zip'
+      ? 'Starting Product Harbor CSV + Images ZIP…'
+      : 'Starting Product Harbor Shopify-ready prepare…';
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/media`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, resume }),
+      });
+      const payload = await response.json();
+      if (!payload.ok) {
+        els.mediaMessage.textContent = payload.error || 'Could not start media job.';
+        if (payload.shopify) renderShopify(payload.shopify);
+        return;
+      }
+      if (payload.destination_shop) {
+        els.mediaMessage.textContent = `Destination store: ${payload.destination_shop}. ${payload.media?.message || ''}`.trim();
+      }
+      renderJob(payload.job);
+      ensurePolling();
+      poll();
+    } catch (error) {
+      els.mediaMessage.textContent = `Media start failed: ${error.message}`;
     }
   }
 
@@ -255,5 +384,53 @@
     }
   });
 
+  els.shopifySave.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/api/shopify/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shop: els.shopifyShop.value.trim(),
+          access_token: els.shopifyToken.value.trim(),
+        }),
+      });
+      const payload = await response.json();
+      if (!payload.ok) {
+        els.shopifyHint.textContent = payload.error || 'Could not save connection.';
+        return;
+      }
+      renderShopify(payload.shopify);
+      if (jobId) poll();
+    } catch (error) {
+      els.shopifyHint.textContent = error.message;
+    }
+  });
+
+  els.shopifyDisconnect.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/api/shopify/disconnect', { method: 'POST' });
+      const payload = await response.json();
+      if (payload.ok) renderShopify(payload.shopify);
+    } catch (error) {
+      els.shopifyHint.textContent = error.message;
+    }
+  });
+
+  els.mediaZip.addEventListener('click', () => startMedia('zip', false));
+  els.mediaShopify.addEventListener('click', () => startMedia('shopify_ready', false));
+  els.mediaResume.addEventListener('click', () => startMedia(lastMediaKind || 'zip', true));
+  els.mediaCancel.addEventListener('click', async () => {
+    if (!jobId) return;
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/media/cancel`, { method: 'POST' });
+      const payload = await response.json();
+      if (payload.ok) renderJob(payload.job);
+      else els.mediaMessage.textContent = payload.error || 'Cancel failed.';
+    } catch (error) {
+      els.mediaMessage.textContent = error.message;
+    }
+  });
+
   syncInteractiveVisibility();
+  refreshShopify();
 })();

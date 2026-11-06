@@ -213,7 +213,9 @@ async def extract(
         scorer = QualityScorer()
         quality = scorer.score_batch(api_result.products)
         if quality >= _QUALITY_THRESHOLD or not api_result.products or customer_context:
-            products = _normalize_batch(api_result.products, platform, shop_url, restore_short_gtin=restore_short_gtin,progress_tier=ExtractionTier.API)
+            products, norm_stats = _normalize_batch_with_stats(
+                api_result.products, platform, shop_url, restore_short_gtin=restore_short_gtin,progress_tier=ExtractionTier.API,
+            )
             reasons = []
             if api_result.complete is not True:
                 reasons.append(api_result.completeness_reason or "source_incomplete")
@@ -244,6 +246,10 @@ async def extract(
                 errors=([api_result.error] if api_result.error else []) + [
                     error for raw in api_result.products for error in raw.get("_identifier_enrichment_errors", [])
                 ],
+                http_pages=api_result.pages_completed,
+                products_discovered=norm_stats.get('products_discovered'),
+                products_failed=norm_stats.get('normalization_dropped'),
+                duplicates_merged=norm_stats.get('duplicates_merged'),
             )
 
     api_errors = [api_result.error] if api_result is not None and api_result.error else []
@@ -554,6 +560,9 @@ async def _extract_interactive_collection(
         assign_identity(product, shop_url or url)
         products.append(product)
 
+    from ._dedupe import dedupe_products
+    products, _dedupe_stats = dedupe_products(products, store=shop_url or url)
+
     reasons = []
     if extractor.completeness_reason:
         reasons.append(extractor.completeness_reason)
@@ -756,16 +765,41 @@ async def _extract_batch_concurrent(
 def _normalize_batch(
     raw_products: list[dict], platform: Platform, shop_url: str, *, restore_short_gtin: bool = False,progress_tier=ExtractionTier.UNIFIED_CRAWL
 ) -> list[Product]:
-    """Normalize a batch of raw product dicts."""
+    """Normalize a batch of raw product dicts and dedupe by platform/store ID or canonical URL."""
+    products, _stats = _normalize_batch_with_stats(
+        raw_products, platform, shop_url, restore_short_gtin=restore_short_gtin, progress_tier=progress_tier,
+    )
+    return products
+
+
+def _normalize_batch_with_stats(
+    raw_products: list[dict], platform: Platform, shop_url: str, *, restore_short_gtin: bool = False,progress_tier=ExtractionTier.UNIFIED_CRAWL
+) -> tuple[list[Product], dict]:
+    """Normalize + dedupe; return products and measured dedupe counters."""
+    from ._dedupe import dedupe_product_dicts, dedupe_products
+    observations_in = len(raw_products)
+    deduped_raw, raw_stats = dedupe_product_dicts(
+        list(raw_products), store=shop_url, platform=getattr(platform, 'value', platform),
+    )
     products = []
-    for raw in raw_products:
+    dropped_invalid = 0
+    for raw in deduped_raw:
         # Keep adapter capture context intact; normalize attaches its trust contract.
         product = normalize(raw, platform=platform, shop_url=shop_url, restore_short_gtin=restore_short_gtin)
         if product:
             products.append(product)
+        else:
+            dropped_invalid += 1
+    products, stats = dedupe_products(products, store=shop_url)
     from ._execution import register_progress_source
     register_progress_source(products,platform,shop_url,normalized=True,tier=progress_tier)
-    return products
+    return products, {
+        'observations_in': observations_in,
+        'products_discovered': observations_in,
+        'duplicates_merged': raw_stats.duplicate_product_observations_merged + stats.duplicate_product_observations_merged,
+        'unique_products': stats.unique_products,
+        'normalization_dropped': dropped_invalid,
+    }
 
 
 def _get_generic_css_schema() -> dict:

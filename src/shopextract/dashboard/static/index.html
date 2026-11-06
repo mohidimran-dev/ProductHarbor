@@ -86,7 +86,7 @@
         </article>
         <article class="capability">
           <h3>Export what you captured</h3>
-          <p>Download products JSON and a run report only when the job actually produced retained evidence.</p>
+          <p>Download products JSON, Shopify CSV, a CSV + Images ZIP backup, or a Shopify-ready CSV with CDN URLs after Product Harbor uploads media for you.</p>
         </article>
       </div>
     </section>
@@ -185,11 +185,15 @@
             </div>
           </div>
           <div class="counts">
-            <div><span>Discovered</span><strong id="discovered">0</strong></div>
-            <div><span>Extracted</span><strong id="extracted">0</strong></div>
-            <div><span>Failed</span><strong id="failed">0</strong></div>
+            <div><span>HTTP pages</span><strong id="http-pages">—</strong></div>
+            <div><span>Discovered</span><strong id="discovered">—</strong></div>
+            <div><span>Extracted</span><strong id="extracted">—</strong></div>
+            <div><span>Failed</span><strong id="failed">—</strong></div>
+            <div><span>Duplicates merged</span><strong id="duplicates">—</strong></div>
+            <div><span>Pending</span><strong id="pending">—</strong></div>
             <div><span>Variants</span><strong id="variants">0</strong></div>
           </div>
+          <p id="run-limit-note" class="note hidden">Limited run — product cap applies; not proof of full collection completeness.</p>
           <p id="message" class="message">No job started.</p>
           <ul id="reasons" class="reasons"></ul>
           <div class="downloads">
@@ -197,6 +201,55 @@
             <a id="download-report" class="download disabled" href="#">Download run report</a>
             <a id="download-shopify" class="download disabled" href="#">Download for Shopify</a>
           </div>
+        </section>
+
+        <section class="panel" aria-label="Product Harbor media exports">
+          <div class="panel-head">
+            <h3>Product Harbor media</h3>
+            <p class="panel-sub">Download a backup ZIP, or prepare a Shopify-ready CSV with CDN image URLs. Product Harbor uploads media only — it does not create products.</p>
+          </div>
+
+          <div class="shopify-conn">
+            <p class="label">Shopify connection</p>
+            <p id="shopify-status" class="value">Checking…</p>
+            <p id="shopify-hint" class="note"></p>
+            <div id="shopify-connect-form" class="shopify-form hidden">
+              <label class="field">
+                <span>Store domain</span>
+                <input id="shopify-shop" type="text" placeholder="your-store.myshopify.com" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>Admin API access token</span>
+                <input id="shopify-token" type="password" placeholder="shpat_…" autocomplete="off" />
+              </label>
+              <div class="actions">
+                <button type="button" id="shopify-save" class="primary">Save connection</button>
+              </div>
+            </div>
+            <div class="actions">
+              <button type="button" id="shopify-disconnect" class="ghost hidden">Disconnect store</button>
+            </div>
+          </div>
+
+          <div class="media-actions actions">
+            <button type="button" id="media-zip" class="ghost" disabled>Download CSV + Images ZIP</button>
+            <button type="button" id="media-shopify" class="primary" disabled>Prepare Shopify-ready CSV</button>
+            <button type="button" id="media-cancel" class="ghost" disabled>Cancel media job</button>
+            <button type="button" id="media-resume" class="ghost" disabled>Resume</button>
+          </div>
+          <p id="media-message" class="message">Run an extraction with products first.</p>
+          <div class="counts media-counts">
+            <div><span>Images total</span><strong id="media-total">0</strong></div>
+            <div><span>Downloaded</span><strong id="media-downloaded">0</strong></div>
+            <div><span>Uploaded</span><strong id="media-uploaded">0</strong></div>
+            <div><span>Failed</span><strong id="media-failed">0</strong></div>
+          </div>
+          <div class="downloads">
+            <a id="download-zip" class="download disabled" href="#">CSV + Images ZIP (backup)</a>
+            <a id="download-shopify-ready" class="download disabled" href="#">Shopify-ready CSV</a>
+            <a id="download-media-failure" class="download disabled" href="#">Failure report</a>
+          </div>
+          <p class="note">ZIP keeps source HTTPS URLs in products.csv plus local images for backup. Shopify’s native CSV importer cannot import those local files automatically.</p>
         </section>
 
         <section id="live-panel" class="panel hidden" aria-label="Live browser preview">
