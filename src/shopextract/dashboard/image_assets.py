@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ class ImageAssociation:
     variant_sku: str | None = None
     variant_title: str | None = None
     alt: str = ''
+    product_url: str | None = None
 
 
 @dataclass
@@ -223,6 +225,7 @@ def collect_image_assets(products: list[dict]) -> tuple[list[ImageAsset], ImageD
     for index, product in enumerate(products):
         title = str(product.get('title') or '').strip() or f'product-{index + 1}'
         handle = slugify_handle(title, fallback=f'product-{index + 1}')
+        product_url = product.get('product_url') if isinstance(product.get('product_url'), str) else None
         gallery_raw: list[str] = []
         primary = product.get('image_url')
         if isinstance(primary, str) and primary.strip():
@@ -247,6 +250,7 @@ def collect_image_assets(products: list[dict]) -> tuple[list[ImageAsset], ImageD
                 role='gallery',
                 position=position,
                 alt=title,
+                product_url=product_url,
             ))
         for variant in product.get('variants') or []:
             if not isinstance(variant, dict):
@@ -262,6 +266,7 @@ def collect_image_assets(products: list[dict]) -> tuple[list[ImageAsset], ImageD
                 variant_sku=variant.get('sku') if isinstance(variant.get('sku'), str) else None,
                 variant_title=variant.get('title') if isinstance(variant.get('title'), str) else None,
                 alt=str(variant.get('title') or title),
+                product_url=product_url,
             ))
 
     stats.source_urls_in = source_count
@@ -276,6 +281,200 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
     temporary.replace(path)
 
 
+_BROWSER_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+}
+IMAGE_CACHE_DIRNAME = 'productharbor-image-cache'
+
+
+def image_cache_dir(profile_dir: Path | str | None) -> Path | None:
+    if not profile_dir:
+        return None
+    path = Path(profile_dir) / IMAGE_CACHE_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def cache_key_for_url(url: str) -> str:
+    return hashlib.sha256((normalize_image_url(url) or url).encode('utf-8')).hexdigest()
+
+
+def write_image_cache(profile_dir: Path | str | None, url: str, content: bytes) -> Path | None:
+    """Persist image bytes captured during interactive scrape for later media packaging."""
+    root = image_cache_dir(profile_dir)
+    if root is None:
+        return None
+    detected = detect_image(content)
+    if detected is None:
+        return None
+    ext, _mime = detected
+    key = cache_key_for_url(url)
+    path = root / f'{key}.{ext}'
+    meta = root / f'{key}.json'
+    if not path.is_file():
+        _atomic_write_bytes(path, content)
+    meta.write_text(json.dumps({'source_url': url, 'normalized_url': normalize_image_url(url)}, indent=2), encoding='utf-8')
+    return path
+
+
+def read_image_cache(profile_dir: Path | str | None, url: str) -> bytes | None:
+    root = image_cache_dir(profile_dir)
+    if root is None:
+        return None
+    key = cache_key_for_url(url)
+    for ext, _mime in (('jpg', 'image/jpeg'), ('png', 'image/png'), ('webp', 'image/webp'), ('gif', 'image/gif')):
+        path = root / f'{key}.{ext}'
+        if path.is_file():
+            content = path.read_bytes()
+            if detect_image(content) is not None:
+                return content
+    return None
+
+
+def _origin_referer(url: str) -> str | None:
+    parts = urlsplit(url)
+    if parts.scheme not in ('http', 'https') or not parts.netloc:
+        return None
+    return f'{parts.scheme}://{parts.netloc}/'
+
+
+async def _fetch_image_httpx(url: str, *, timeout: float) -> bytes:
+    headers = dict(_BROWSER_HEADERS)
+    referer = _origin_referer(url)
+    if referer:
+        headers['Referer'] = referer
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
+
+
+def _prefer_product_page(asset: ImageAsset) -> str | None:
+    for assoc in asset.associations:
+        if assoc.product_url and assoc.product_url.startswith(('http://', 'https://')):
+            return assoc.product_url
+    return _origin_referer(asset.source_url)
+
+
+async def _fetch_images_via_browser_profile(
+    assets: list[ImageAsset],
+    profile_dir: Path,
+    *,
+    timeout_ms: int = 45000,
+) -> dict[str, bytes | Exception]:
+    """Fetch image bytes using cookies from an interactive Chromium profile.
+
+    Navigates the product page first — brand WAFs often 403 bare image URLs even
+    with a warm profile unless the document context matches a real PDP.
+    """
+    results: dict[str, bytes | Exception] = {}
+    if not assets:
+        return results
+    urls = [a.source_url for a in assets]
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover - optional runtime dep
+        for url in urls:
+            results[url] = exc
+        return results
+    profile_dir = Path(profile_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    # Headless Chromium is often blocked by the same brand WAF that required the
+    # interactive scrape. Reuse the persistent profile in headed mode so cookies
+    # and bot signals match the session that already cleared the gate.
+    try:
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                headless=False,
+                viewport={'width': 1280, 'height': 720},
+            )
+            try:
+                page = context.pages[0] if context.pages else await context.new_page()
+                grouped: dict[str, list[ImageAsset]] = {}
+                for asset in assets:
+                    seed = _prefer_product_page(asset) or _origin_referer(asset.source_url) or ''
+                    grouped.setdefault(seed, []).append(asset)
+                for seed, group in grouped.items():
+                    wanted = {a.source_url: a for a in group}
+                    captured: dict[str, bytes] = {}
+
+                    async def on_response(response, wanted=wanted, captured=captured) -> None:
+                        try:
+                            if response.status != 200:
+                                return
+                            ctype = (response.headers or {}).get('content-type', '')
+                            if 'image' not in ctype.lower() and 'is/image' not in response.url:
+                                return
+                            body = await response.body()
+                            if detect_image(body) is None:
+                                return
+                            # Exact URL or normalized match against wanted set.
+                            if response.url in wanted:
+                                captured[response.url] = body
+                                return
+                            norm = normalize_image_url(response.url)
+                            for source_url in list(wanted):
+                                if normalize_image_url(source_url) == norm:
+                                    captured[source_url] = body
+                        except Exception:
+                            return
+
+                    page.on('response', on_response)
+                    if seed:
+                        with contextlib.suppress(Exception):
+                            await page.goto(
+                                seed,
+                                wait_until='domcontentloaded',
+                                timeout=min(timeout_ms, 60000),
+                            )
+                            with contextlib.suppress(Exception):
+                                await page.wait_for_timeout(1200)
+                                await page.mouse.wheel(0, 1800)
+                                await page.wait_for_timeout(800)
+                    for asset in group:
+                        url = asset.source_url
+                        if url in captured:
+                            results[url] = captured[url]
+                            continue
+                        try:
+                            response = await page.request.get(
+                                url,
+                                timeout=timeout_ms,
+                                headers={
+                                    **_BROWSER_HEADERS,
+                                    **({'Referer': seed} if seed else {}),
+                                },
+                            )
+                            if not response.ok:
+                                raise httpx.HTTPStatusError(
+                                    f'HTTP {response.status}',
+                                    request=httpx.Request('GET', url),
+                                    response=httpx.Response(
+                                        response.status,
+                                        request=httpx.Request('GET', url),
+                                    ),
+                                )
+                            body = await response.body()
+                            if detect_image(body) is None:
+                                raise ValueError('browser_fetch_not_image')
+                            results[url] = body
+                        except Exception as exc:
+                            results[url] = exc
+                    with contextlib.suppress(Exception):
+                        page.remove_listener('response', on_response)
+            finally:
+                await context.close()
+    except Exception as exc:
+        for url in urls:
+            results.setdefault(url, exc)
+    return results
+
+
 async def download_assets(
     assets: list[ImageAsset],
     images_dir: Path,
@@ -286,6 +485,7 @@ async def download_assets(
     on_progress=None,
     checkpoint_path: Path | None = None,
     prior_stats: ImageDedupeStats | None = None,
+    browser_profile_dir: Path | None = None,
 ) -> dict:
     images_dir.mkdir(parents=True, exist_ok=True)
     used_names: set[str] = set()
@@ -328,90 +528,147 @@ async def download_assets(
     semaphore = asyncio.Semaphore(max(1, concurrency))
     downloaded = sum(1 for a in assets if a.status == 'downloaded')
     failed = sum(1 for a in assets if a.status == 'failed')
+    pending_assets = [
+        a for a in assets
+        if not (a.status == 'downloaded' and a.local_path and Path(a.local_path).is_file())
+    ]
 
-    async def one(asset: ImageAsset) -> None:
+    async def commit_content(asset: ImageAsset, content: bytes) -> None:
         nonlocal downloaded, failed
-        if cancel_event is not None and cancel_event.is_set():
+        detected = detect_image(content)
+        if detected is None:
+            asset.status = 'failed'
+            asset.error = 'not_a_supported_image_or_html_error'
+            failed += 1
+            stats.failures += 1
             return
-        if asset.status == 'downloaded' and asset.local_path and Path(asset.local_path).is_file():
+        ext, mime = detected
+        digest = hashlib.sha256(content).hexdigest()
+        pix = pixel_fingerprint(content)
+        asset.content_hash = digest
+        asset.pixel_hash = pix
+
+        async with write_lock:
+            if digest in hash_to_file:
+                filename, local_path, size, known_mime = hash_to_file[digest]
+                asset.filename = filename
+                asset.local_path = local_path
+                asset.byte_size = size
+                asset.mime_type = known_mime
+                asset.status = 'downloaded'
+                asset.reused_file = True
+                stats.files_reused += 1
+                downloaded += 1
+            elif pix and pix in pixel_to_hash and pixel_to_hash[pix] in hash_to_file:
+                prior_digest = pixel_to_hash[pix]
+                filename, local_path, size, known_mime = hash_to_file[prior_digest]
+                asset.filename = filename
+                asset.local_path = local_path
+                asset.byte_size = size
+                asset.mime_type = known_mime
+                asset.status = 'downloaded'
+                asset.reused_file = True
+                stats.files_reused += 1
+                downloaded += 1
+            else:
+                filename = deterministic_filename(asset, ext=ext, used=used_names)
+                path = images_dir / filename
+                _atomic_write_bytes(path, content)
+                asset.filename = filename
+                asset.local_path = str(path)
+                asset.byte_size = len(content)
+                asset.mime_type = mime
+                asset.status = 'downloaded'
+                hash_to_file[digest] = (filename, str(path), len(content), mime)
+                if pix:
+                    pixel_to_hash[pix] = digest
+                downloaded += 1
+
+    def emit_progress() -> None:
+        if on_progress is not None:
+            on_progress({
+                'total': len(assets),
+                'downloaded': downloaded,
+                'failed': failed,
+                'pending': len(assets) - downloaded - failed,
+                'files_reused': stats.files_reused,
+            })
+        if checkpoint_path is not None:
+            save_asset_checkpoint(assets, checkpoint_path)
+
+    # Prefer bytes captured during the interactive scrape (same browser session as the PDP).
+    if browser_profile_dir is not None:
+        still_pending: list[ImageAsset] = []
+        for asset in pending_assets:
+            cached = read_image_cache(browser_profile_dir, asset.source_url)
+            if cached is None:
+                for alt in asset.alternate_urls:
+                    cached = read_image_cache(browser_profile_dir, alt)
+                    if cached is not None:
+                        break
+            if cached is None:
+                still_pending.append(asset)
+                continue
+            await commit_content(asset, cached)
+            emit_progress()
+        pending_assets = still_pending
+
+    async def one_httpx(asset: ImageAsset) -> None:
+        nonlocal failed
+        if cancel_event is not None and cancel_event.is_set():
             return
         async with semaphore:
             if cancel_event is not None and cancel_event.is_set():
                 return
             try:
-                async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-                    response = await client.get(asset.source_url)
-                    response.raise_for_status()
-                    content = response.content
-                detected = detect_image(content)
-                if detected is None:
+                content = await _fetch_image_httpx(asset.source_url, timeout=timeout)
+                await commit_content(asset, content)
+                if browser_profile_dir is not None:
+                    write_image_cache(browser_profile_dir, asset.source_url, content)
+            except Exception as exc:
+                # Leave pending for browser-profile retry when available.
+                if browser_profile_dir is not None:
+                    asset.status = 'pending'
+                    asset.error = f'httpx:{type(exc).__name__}: {exc}'[:300]
+                else:
                     asset.status = 'failed'
-                    asset.error = 'not_a_supported_image_or_html_error'
+                    asset.error = f'{type(exc).__name__}: {exc}'[:300]
                     failed += 1
                     stats.failures += 1
-                    return
-                ext, mime = detected
-                digest = hashlib.sha256(content).hexdigest()
-                pix = pixel_fingerprint(content)
-                asset.content_hash = digest
-                asset.pixel_hash = pix
+            emit_progress()
 
-                async with write_lock:
-                    # Byte-identical reuse
-                    if digest in hash_to_file:
-                        filename, local_path, size, known_mime = hash_to_file[digest]
-                        asset.filename = filename
-                        asset.local_path = local_path
-                        asset.byte_size = size
-                        asset.mime_type = known_mime
-                        asset.status = 'downloaded'
-                        asset.reused_file = True
-                        stats.files_reused += 1
-                        downloaded += 1
-                    # Exact same decoded pixels (different encoding/metadata)
-                    elif pix and pix in pixel_to_hash and pixel_to_hash[pix] in hash_to_file:
-                        prior_digest = pixel_to_hash[pix]
-                        filename, local_path, size, known_mime = hash_to_file[prior_digest]
-                        asset.filename = filename
-                        asset.local_path = local_path
-                        asset.byte_size = size
-                        asset.mime_type = known_mime
-                        asset.status = 'downloaded'
-                        asset.reused_file = True
-                        # Keep content_hash as this download's bytes for provenance,
-                        # but file points at retained path; map pixel -> retained digest.
-                        stats.files_reused += 1
-                        downloaded += 1
-                    else:
-                        filename = deterministic_filename(asset, ext=ext, used=used_names)
-                        path = images_dir / filename
-                        _atomic_write_bytes(path, content)
-                        asset.filename = filename
-                        asset.local_path = str(path)
-                        asset.byte_size = len(content)
-                        asset.mime_type = mime
-                        asset.status = 'downloaded'
-                        hash_to_file[digest] = (filename, str(path), len(content), mime)
-                        if pix:
-                            pixel_to_hash[pix] = digest
-                        downloaded += 1
-            except Exception as exc:
+    await asyncio.gather(*(one_httpx(asset) for asset in pending_assets))
+
+    retry = [
+        a for a in pending_assets
+        if a.status != 'downloaded' and browser_profile_dir is not None
+    ]
+    if retry and (cancel_event is None or not cancel_event.is_set()):
+        fetched = await _fetch_images_via_browser_profile(
+            retry,
+            Path(browser_profile_dir),
+            timeout_ms=int(timeout * 1000),
+        )
+        for asset in retry:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            payload = fetched.get(asset.source_url)
+            if isinstance(payload, (bytes, bytearray)):
+                body = bytes(payload)
+                await commit_content(asset, body)
+                write_image_cache(browser_profile_dir, asset.source_url, body)
+            else:
                 asset.status = 'failed'
-                asset.error = f'{type(exc).__name__}: {exc}'[:300]
+                detail = payload if isinstance(payload, Exception) else Exception('browser_fetch_missed')
+                prior = asset.error or ''
+                asset.error = (
+                    f'{prior} | browser:{type(detail).__name__}: {detail}'
+                    if prior else f'{type(detail).__name__}: {detail}'
+                )[:300]
                 failed += 1
                 stats.failures += 1
-            if on_progress is not None:
-                on_progress({
-                    'total': len(assets),
-                    'downloaded': downloaded,
-                    'failed': failed,
-                    'pending': len(assets) - downloaded - failed,
-                    'files_reused': stats.files_reused,
-                })
-            if checkpoint_path is not None:
-                save_asset_checkpoint(assets, checkpoint_path)
+            emit_progress()
 
-    await asyncio.gather(*(one(asset) for asset in assets))
     if checkpoint_path is not None:
         save_asset_checkpoint(assets, checkpoint_path)
 
@@ -573,16 +830,34 @@ def url_map_from_assets(assets: list[ImageAsset], *, prefer_cdn: bool = False) -
     return mapping
 
 
-def rewrite_products_urls(products: list[dict], url_map: dict[str, str]) -> list[dict]:
+def rewrite_products_urls(
+    products: list[dict],
+    url_map: dict[str, str],
+    *,
+    drop_unmapped: bool = False,
+) -> list[dict]:
+    """Rewrite image URLs through url_map.
+
+    When drop_unmapped is True (Shopify-ready CSV), leave blank any source URL that
+    did not map to a Shopify CDN URL — Shopify Admin cannot fetch hotlink-protected
+    brand CDNs and will reject the import with image errors.
+    """
     rewritten = []
     for product in products:
         item = dict(product)
-        if isinstance(item.get('image_url'), str) and item['image_url'] in url_map:
-            item['image_url'] = url_map[item['image_url']]
+        primary = item.get('image_url') if isinstance(item.get('image_url'), str) else ''
+        if primary and primary in url_map:
+            item['image_url'] = url_map[primary]
+        elif drop_unmapped:
+            item['image_url'] = ''
         extras = []
         for url in item.get('additional_images') or []:
-            if isinstance(url, str):
-                extras.append(url_map.get(url, url))
+            if not isinstance(url, str) or not url.strip():
+                continue
+            if url in url_map:
+                extras.append(url_map[url])
+            elif not drop_unmapped:
+                extras.append(url)
         item['additional_images'] = extras
         variants = []
         for variant in product.get('variants') or []:
@@ -592,6 +867,8 @@ def rewrite_products_urls(products: list[dict], url_map: dict[str, str]) -> list
             featured = copy.get('featured_image')
             if isinstance(featured, str) and featured in url_map:
                 copy['featured_image'] = url_map[featured]
+            elif drop_unmapped and isinstance(featured, str):
+                copy['featured_image'] = None
             variants.append(copy)
         item['variants'] = variants
         rewritten.append(item)

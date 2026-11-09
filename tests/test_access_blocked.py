@@ -11,6 +11,7 @@ from shopextract._access import (
     AccessBlockedError,
     detect_access_block,
     format_access_blocked,
+    human_action_guidance,
 )
 from shopextract._extract import extract
 from shopextract._models import Platform
@@ -37,6 +38,16 @@ def test_detect_http_403_and_waiting_interstitial():
     assert f'url={URL}' in message
     assert 'status=403' in message
     assert 'reason=waiting_interstitial' in message
+
+
+def test_human_action_guidance_for_waiting_and_captcha():
+    waiting = human_action_guidance('waiting_interstitial')
+    assert waiting['kind'] == 'waiting_interstitial'
+    assert 'Chromium' in waiting['steps'][0]
+    assert waiting['continue_label'].startswith('Continue')
+    captcha = human_action_guidance('cloudflare_challenge')
+    assert 'CAPTCHA' in captcha['title']
+    assert any('Continue' in step for step in captcha['steps'])
 
 
 def test_detect_plain_403_without_body_markers():

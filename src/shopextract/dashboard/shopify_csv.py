@@ -206,13 +206,14 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
                 row['Description'] = description
                 row['Vendor'] = vendor
                 row['Type'] = product_type
-                row['Published on online store'] = 'TRUE'
-                row['Status'] = 'Active'
-                row['Charge tax'] = 'TRUE'
-                row['Requires shipping'] = 'TRUE'
+                # Shopify Admin CSV docs require lowercase enums (true/false/deny/active).
+                row['Published on online store'] = 'true'
+                row['Status'] = 'active'
+                row['Charge tax'] = 'true'
+                row['Requires shipping'] = 'true'
                 row['Fulfillment service'] = 'manual'
-                row['Gift card'] = 'FALSE'
-                row['Continue selling when out of stock'] = 'DENY'
+                row['Gift card'] = 'false'
+                row['Continue selling when out of stock'] = 'deny'
                 if image_url:
                     row['Product image URL'] = image_url
                     row['Image position'] = '1'
@@ -229,8 +230,12 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
             row['Compare-at price'] = variant['compare'] or ''
             if variant['image']:
                 row['Variant image URL'] = variant['image']
-            for option_index, (name, value) in enumerate(variant['options'][:3], start=1):
-                row[f'Option{option_index} name'] = name
+            options = list(variant['options'][:3])
+            # Shopify single-variant rows still need a Title option when none were scraped.
+            if not options:
+                options = [('Title', 'Default Title')]
+            for option_index, (name, value) in enumerate(options, start=1):
+                row[f'Option{option_index} name'] = name or 'Title'
                 row[f'Option{option_index} value'] = value
             rows.append(row)
 

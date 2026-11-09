@@ -49,9 +49,14 @@ def publish_shopify_taxonomy(staged, *, catalog_root):
         _verified(temporary,expected)
         os.rename(temporary,destination)
         temporary=None
-        directory=os.open(release,os.O_RDONLY)
-        try:os.fsync(directory)
-        finally:os.close(directory)
+        # Directory fsync is a POSIX durability hint; Windows rejects O_RDONLY on dirs.
+        try:
+            directory=os.open(release,os.O_RDONLY)
+        except OSError:
+            directory=None
+        if directory is not None:
+            try:os.fsync(directory)
+            finally:os.close(directory)
         return staged.manifest
     except (ValueError,TypeError,KeyError,OSError) as error:
         raise TaxonomyPublicationError('Catalog publication failed: '+str(error)) from error

@@ -60,6 +60,8 @@ Thumbs.db
 
 # Local runtime artifacts (do not publish)
 artifacts/
+# Generated Shopify taxonomy compact catalog (prepared locally / embedded for editable installs)
+src/shopextract/taxonomies/shopify/data/
 # Explicit: Shopify Admin tokens for Product Harbor (also under artifacts/)
 **/secrets/
 **/browser-profiles/

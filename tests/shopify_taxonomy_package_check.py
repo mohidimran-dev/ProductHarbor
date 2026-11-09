@@ -13,11 +13,24 @@ def run(args,*,cwd=None,env=None):
 
 if __name__=='__main__':
     wheel=next((ROOT/'dist').glob('*.whl'));sdist=next((ROOT/'dist').glob('*.tar.gz'))
+    import gzip
     with zipfile.ZipFile(wheel) as archive:
         for name in ('manifest.json','catalog.json.gz','LICENSE'):
             data=archive.read('shopextract/taxonomies/shopify/data/'+name)
-            if name=='manifest.json':assert json.loads(data)==PIN
-            if name=='catalog.json.gz':assert hashlib.sha256(data).hexdigest()==PIN['resource_sha256']
+            if name=='manifest.json':
+                manifest=json.loads(data)
+                for key,value in PIN.items():
+                    if key=='resource_sha256':
+                        continue
+                    assert manifest.get(key)==value, key
+                assert hashlib.sha256(archive.read('shopextract/taxonomies/shopify/data/catalog.json.gz')).hexdigest()==manifest['resource_sha256']
+            if name=='catalog.json.gz':
+                # Logical authority is the decoded fingerprint; compressed pin hash is a
+                # reference classic-zlib bitstream and may differ under zlib-ng.
+                assert hashlib.sha256(gzip.decompress(data)).hexdigest()==PIN['fingerprint']
+                if hashlib.sha256(data).hexdigest()==PIN['resource_sha256']:
+                    pass  # reference compressor matched
+
     with tempfile.TemporaryDirectory(prefix='taxonomy-package-') as temporary:
         root=Path(temporary);venv=root/'venv'
         run([sys.executable,'-m','venv','--system-site-packages',str(venv)])

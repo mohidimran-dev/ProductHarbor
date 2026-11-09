@@ -52,8 +52,12 @@ def test_shopify_rows_match_template_headers_and_map_fields():
     assert rows[0]['Option1 name'] == 'Color'
     assert rows[0]['Option1 value'] == 'Brown'
     assert rows[0]['Variant image URL'] == 'https://cdn.example/variant.jpg'
-    assert rows[0]['Published on online store'] == 'TRUE'
-    assert rows[0]['Status'] == 'Active'
+    assert rows[0]['Published on online store'] == 'true'
+    assert rows[0]['Status'] == 'active'
+    assert rows[0]['Charge tax'] == 'true'
+    assert rows[0]['Requires shipping'] == 'true'
+    assert rows[0]['Gift card'] == 'false'
+    assert rows[0]['Continue selling when out of stock'] == 'deny'
     assert rows[1]['URL handle'] == 'neverfull-mm'
     assert rows[1]['Title'] == ''
     assert rows[1]['Product image URL'] == 'https://cdn.example/side.jpg'
@@ -62,3 +66,25 @@ def test_shopify_rows_match_template_headers_and_map_fields():
     text = shopify_csv_text(products)
     reader = csv.DictReader(StringIO(text))
     assert reader.fieldnames == SHOPIFY_PRODUCT_HEADERS
+
+
+def test_shopify_rows_default_title_option_and_lowercase_enums():
+    products = [
+        Product(
+            title='Solo Shoe',
+            description='One size.',
+            price=Decimal('100'),
+            currency='USD',
+            sku='SOLO-1',
+            image_url='https://cdn.example/solo.jpg',
+            platform=Platform.GENERIC,
+            variants=[],
+        ),
+    ]
+    rows = products_to_shopify_rows(products)
+    assert len(rows) == 1
+    assert rows[0]['Option1 name'] == 'Title'
+    assert rows[0]['Option1 value'] == 'Default Title'
+    assert rows[0]['Status'] == 'active'
+    assert rows[0]['Published on online store'] == 'true'
+    assert rows[0]['Continue selling when out of stock'] == 'deny'

@@ -64,16 +64,33 @@ print(json.dumps({'application_imported':False,'prepare_file':p.__file__,'python
         'dependencies':'metadata-derived HTTPX+taxonomy-build(PyYAML), existing environment resolved via pip --no-index; no heavyweight runtime bootstrap',
         'python_scope':sys.version,'matrix_311_312':'workflow configuration; not executed locally','editable':'dry-run metadata only; developer environment unchanged'}
     if passed:
+        import gzip
         pin=json.loads((ROOT/'src/shopextract/taxonomies/shopify/pin.json').read_text())
         directory=root/'build/shopify-taxonomy/catalogs'/pin['release']/pin['fingerprint']
-        assert json.loads((directory/'manifest.json').read_text())==pin
+        manifest=json.loads((directory/'manifest.json').read_text())
+        for key,value in pin.items():
+            if key=='resource_sha256':
+                continue
+            assert manifest.get(key)==value, key
+        catalog=(directory/'catalog.json.gz').read_bytes()
+        assert hashlib.sha256(catalog).hexdigest()==manifest['resource_sha256']
+        assert hashlib.sha256(gzip.decompress(catalog)).hexdigest()==pin['fingerprint']
         wheel=next((root/'dist').glob('*.whl'));sdist=next((root/'dist').glob('*.tar.gz'))
         with zipfile.ZipFile(wheel) as archive:
-            assert json.loads(archive.read('shopextract/taxonomies/shopify/data/manifest.json'))==pin
-            assert hashlib.sha256(archive.read('shopextract/taxonomies/shopify/data/catalog.json.gz')).hexdigest()==pin['resource_sha256']
+            embedded=json.loads(archive.read('shopextract/taxonomies/shopify/data/manifest.json'))
+            for key,value in pin.items():
+                if key=='resource_sha256':
+                    continue
+                assert embedded.get(key)==value, key
+            blob=archive.read('shopextract/taxonomies/shopify/data/catalog.json.gz')
+            assert hashlib.sha256(gzip.decompress(blob)).hexdigest()==pin['fingerprint']
         with tarfile.open(sdist) as archive:
             member=next(m for m in archive.getmembers() if m.name.endswith('/src/shopextract/taxonomies/shopify/data/manifest.json'))
-            assert json.load(archive.extractfile(member))==pin
+            sdist_manifest=json.load(archive.extractfile(member))
+            for key,value in pin.items():
+                if key=='resource_sha256':
+                    continue
+                assert sdist_manifest.get(key)==value, key
         record.update(fingerprint=pin['fingerprint'],counts=pin['counts'],wheel_bytes=wheel.stat().st_size,sdist_bytes=sdist.stat().st_size)
     (OUT/'delivery-full-proof.json').write_text(json.dumps(record,indent=2)+'\n')
     print(json.dumps({k:v for k,v in record.items() if k!='stages'}));sys.exit(0 if passed else 1)

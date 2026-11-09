@@ -64,6 +64,7 @@ class MediaJob:
     _started_mono: float | None = None
     _work_dir: Path | None = None
     resumable: bool = False
+    browser_profile_dir: str | None = None
 
     def public(self) -> dict:
         elapsed = self.elapsed_seconds
@@ -178,6 +179,9 @@ class MediaJobManager:
             job.message = 'Resuming Product Harbor media job…'
             job.finished_at = None
             job.partial = False
+            job.browser_profile_dir = (
+                job.browser_profile_dir or getattr(parent_job, 'browser_profile_dir', None)
+            )
         else:
             import uuid
             job = MediaJob(
@@ -187,6 +191,8 @@ class MediaJobManager:
                 shop=shop,
                 content_hash=_content_scope_hash(products),
             )
+            # Reuse interactive Chromium cookies when the parent scrape used a headed profile.
+            job.browser_profile_dir = getattr(parent_job, 'browser_profile_dir', None)
             # Preserve prior artifacts across re-runs / kind switches.
             if existing is not None:
                 if existing.zip_path and Path(existing.zip_path).is_file():
@@ -233,6 +239,7 @@ class MediaJobManager:
             )
 
         try:
+            profile = getattr(job, 'browser_profile_dir', None)
             await download_assets(
                 assets,
                 images_dir,
@@ -240,6 +247,7 @@ class MediaJobManager:
                 cancel_event=job.cancel_event,
                 on_progress=on_download,
                 checkpoint_path=checkpoint_path,
+                browser_profile_dir=Path(profile) if profile else None,
             )
             job.downloaded = sum(1 for a in assets if a.status == 'downloaded')
             job.download_failed = sum(1 for a in assets if a.status == 'failed')
@@ -274,7 +282,11 @@ class MediaJobManager:
                 job.partial = bool(report.get('partial'))
                 if job.partial:
                     job.state = 'partial'
+                    blocked = job.download_failed and job.downloaded == 0
                     job.message = (
+                        'Image download blocked by the source site (403). Re-run interactive '
+                        'scrape, clear the waiting room so images load in Chromium, then retry ZIP / Shopify-ready.'
+                        if blocked else
                         'Product Harbor ZIP ready (partial). Local images are a backup; '
                         'Shopify native CSV import still needs accessible HTTPS image URLs.'
                     )
@@ -361,7 +373,9 @@ class MediaJobManager:
                     url_map[asset.source_url] = asset.shopify_cdn_url
                 for alt in asset.alternate_urls:
                     url_map[alt] = asset.shopify_cdn_url
-            rewritten = rewrite_products_urls(products, url_map)
+            # Never leave hotlink-blocked source URLs in the Shopify-ready CSV —
+            # Admin import would fail on those image fetches.
+            rewritten = rewrite_products_urls(products, url_map, drop_unmapped=True)
             ready_name = 'products-shopify-ready.csv'
             if job.download_failed or job.upload_failed or any(
                 a.status == 'downloaded' and not a.shopify_cdn_url for a in assets

@@ -194,6 +194,9 @@ async def test_run_interactive_blocked_after_human_gate(monkeypatch):
         async def goto(self, *_a, **_k):
             return FakeResponse()
 
+        async def reload(self, *_a, **_k):
+            return FakeResponse()
+
         async def content(self):
             return waiting
 
@@ -244,3 +247,4 @@ async def test_run_interactive_blocked_after_human_gate(monkeypatch):
     assert session.block_message is not None
     assert session.block_message.startswith(ACCESS_BLOCKED)
     assert 'waiting_interstitial' in session.block_message
+    assert session.evidence.get('human_action', {}).get('kind') == 'waiting_interstitial'

@@ -14,6 +14,9 @@
     cancel: document.getElementById('cancel'),
     interactive: document.getElementById('interactive'),
     interactiveWrap: document.getElementById('interactive-wrap'),
+    humanGate: document.getElementById('human-gate'),
+    humanGateTitle: document.getElementById('human-gate-title'),
+    humanGateSteps: document.getElementById('human-gate-steps'),
     note: document.getElementById('backend-note'),
     state: document.getElementById('state'),
     elapsed: document.getElementById('elapsed'),
@@ -167,7 +170,29 @@
     els.variants.textContent = String(job.counts?.variants ?? 0);
     els.runLimitNote?.classList.toggle('hidden', !job.limited_run);
     els.message.textContent = job.message || '';
-    els.continueBtn.disabled = !(job.state === 'running' && job.interactive_browser);
+    const interactiveRunning = job.state === 'running' && job.interactive_browser;
+    const awaiting = Boolean(job.awaiting_human);
+    els.continueBtn.disabled = !interactiveRunning;
+    els.continueBtn.classList.toggle('primary', interactiveRunning && awaiting);
+    els.continueBtn.classList.toggle('ghost', !(interactiveRunning && awaiting));
+    els.continueBtn.textContent = (job.human_action && job.human_action.continue_label)
+      || 'Continue';
+    const action = job.human_action;
+    const showGate = Boolean(
+      action
+      && job.interactive_browser
+      && (awaiting || job.state === 'blocked' || job.state === 'running'),
+    );
+    els.humanGate.classList.toggle('hidden', !showGate);
+    if (showGate) {
+      els.humanGateTitle.textContent = action.title || 'Human step required';
+      els.humanGateSteps.innerHTML = '';
+      for (const step of action.steps || []) {
+        const li = document.createElement('li');
+        li.textContent = step;
+        els.humanGateSteps.appendChild(li);
+      }
+    }
     els.reasons.innerHTML = '';
     for (const reason of job.incompleteness_reasons || []) {
       const li = document.createElement('li');

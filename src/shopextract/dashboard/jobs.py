@@ -93,6 +93,7 @@ class DashboardJob:
     _result: Any = None
     _progress: ProgressCheckpoint | None = None
     awaiting_human: bool = False
+    human_action: dict | None = None
     media: Any = None  # optional MediaJob public snapshot helper
 
     def public(self) -> dict:
@@ -110,6 +111,7 @@ class DashboardJob:
             'interactive_browser': self.interactive_browser,
             'browser_profile_dir': self.browser_profile_dir,
             'awaiting_human': self.awaiting_human,
+            'human_action': dict(self.human_action) if self.human_action else None,
             'state': self.state,
             'created_at': self.created_at,
             'started_at': self.started_at,
@@ -187,6 +189,7 @@ class DashboardJobManager:
         if parsed.scheme not in ('http', 'https') or not parsed.hostname:
             raise ValueError('Expected an HTTP(S) collection URL.')
         from ..extractors._interactive_browser import default_profile_dir
+        from .._access import human_action_guidance
         profile = str(default_profile_dir(url.strip())) if interactive_browser else None
         job = DashboardJob(
             job_id=uuid.uuid4().hex,
@@ -195,6 +198,7 @@ class DashboardJobManager:
             mode=mode,
             interactive_browser=interactive_browser,
             browser_profile_dir=profile,
+            human_action=human_action_guidance('unknown') if interactive_browser else None,
         )
         async with self._lock:
             self.jobs[job.job_id] = job
@@ -225,7 +229,10 @@ class DashboardJobManager:
         from ..extractors._interactive_browser import signal_continue
         signal_continue(Path(job.browser_profile_dir))
         job.awaiting_human = False
-        job.message = 'Continue signal sent; waiting for page re-check.'
+        job.human_action = None
+        job.message = (
+            'Continue received. Re-checking the Chromium page, then scraping visible products…'
+        )
         return job
 
     def _progress_counts(self, job: DashboardJob) -> tuple[int | None, int | None]:
@@ -256,21 +263,30 @@ class DashboardJobManager:
         # Interactive runs need room for a human gate; full collections need more budget.
         if job.interactive_browser:
             timeout = 900.0
+            from .._access import human_action_guidance
+            job.human_action = human_action_guidance('unknown')
             job.message = (
-                'Interactive browser opened. Complete any challenge in the Chromium window, '
-                'then click Continue here (or create .productharbor_continue in the profile dir).'
+                'Opening Chromium. If a waiting room, CAPTCHA, or login appears, '
+                'complete it in that window — steps will show here — then click Continue.'
             )
-            job.awaiting_human = True
+            job.awaiting_human = False
         else:
             timeout = 300.0 if job.mode == 'full' else 120.0
         try:
             async def operation():
                 from ..extractors._interactive_browser import reset_live_hooks, set_live_hooks
-                tokens = (None, None)
+                tokens = (None, None, None)
+
+                def on_human_gate(action: dict, _block) -> None:
+                    job.awaiting_human = True
+                    job.human_action = dict(action)
+                    job.message = str(action.get('summary') or job.message)
+
                 if job.interactive_browser:
                     tokens = set_live_hooks(
                         on_product=lambda record: self._on_live_product(job, record),
                         on_snapshot=lambda png, label: self._on_live_snapshot(job, png, label),
+                        on_human_gate=on_human_gate,
                     )
                 try:
                     with execution_policy(policy, timeout) as state:
@@ -298,21 +314,27 @@ class DashboardJobManager:
             if job.cancel_event.is_set():
                 raise asyncio.CancelledError()
             self._finalize_result(job, result)
+            job.awaiting_human = False
+            if job.state not in ('blocked',):
+                job.human_action = None
         except asyncio.CancelledError:
             job.state = 'cancelled'
             job.message = 'Job cancelled.'
             job.outcome = 'failed'
+            job.awaiting_human = False
             # Preserve any existing export files; do not write empty replacements.
         except asyncio.TimeoutError:
             job.state = 'failed'
             job.message = 'Operation timed out.'
             job.errors = ['operation_timeout']
             job.outcome = 'failed'
+            job.awaiting_human = False
         except Exception as exc:
             job.state = 'failed'
             job.message = f'Extraction failed: {type(exc).__name__}'
             job.errors = [str(exc)]
             job.outcome = 'failed'
+            job.awaiting_human = False
         finally:
             if job._started_mono is not None:
                 job.elapsed_seconds = round(time.monotonic() - job._started_mono, 2)
@@ -350,6 +372,8 @@ class DashboardJobManager:
         job.pending = max(0, MODE_MAX[job.mode] - job.extracted)
         job.variant_count = sum(int(item.get('variant_count') or 0) for item in job.preview)
         job.image_count = sum(1 for item in job.preview if item.get('image_url'))
+        job.awaiting_human = False
+        job.human_action = None
         job.message = f'Live preview: extracted {job.extracted} product(s)…'
 
     def _on_live_snapshot(self, job: DashboardJob, png: bytes, label: str) -> None:
@@ -393,6 +417,13 @@ class DashboardJobManager:
             job.message = blocked if blocked != ACCESS_BLOCKED else (
                 f'{ACCESS_BLOCKED} url={job.url} status=unknown reason=access_blocked'
             )
+            if job.human_action is None:
+                from .._access import human_action_guidance
+                reason = 'unknown'
+                text = job.message or ''
+                if 'reason=' in text:
+                    reason = text.rsplit('reason=', 1)[-1].strip().split()[0]
+                job.human_action = human_action_guidance(reason)
             return
         if outcome == 'complete' and result.catalog_complete is True:
             job.state = 'succeeded'

@@ -157,6 +157,11 @@
             <button type="button" id="continue" class="ghost" disabled>Continue</button>
             <button type="button" id="cancel" class="ghost" disabled>Cancel</button>
           </div>
+          <aside id="human-gate" class="human-gate hidden" aria-live="polite">
+            <h4 id="human-gate-title">Human step required</h4>
+            <ol id="human-gate-steps"></ol>
+            <p id="human-gate-note" class="note">Product Harbor does not solve CAPTCHAs or bypass access protections.</p>
+          </aside>
           <p id="backend-note" class="note">Auto Detect finds the platform, then routes to the matching ProductHarbor extractor.</p>
         </section>
 
@@ -249,7 +254,7 @@
             <a id="download-shopify-ready" class="download disabled" href="#">Shopify-ready CSV</a>
             <a id="download-media-failure" class="download disabled" href="#">Failure report</a>
           </div>
-          <p class="note">ZIP keeps source HTTPS URLs in products.csv plus local images for backup. Shopify’s native CSV importer cannot import those local files automatically.</p>
+          <p class="note">Use “Prepare Shopify-ready CSV” before Admin import: Product Harbor downloads images, uploads them to your store Files CDN, then rewrites the CSV. Plain “Download for Shopify” keeps source image URLs — protected brand CDNs (403) will make Shopify reject the import. ZIP is a local backup only; Shopify cannot import those local image files.</p>
         </section>
 
         <section id="live-panel" class="panel hidden" aria-label="Live browser preview">

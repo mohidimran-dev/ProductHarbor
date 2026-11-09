@@ -102,6 +102,27 @@ def test_rewrite_preserves_unmapped_and_associations():
     assert mapped[0]['variants'][0]['featured_image'] == 'https://cdn.shopify.com/a.jpg'
 
 
+def test_rewrite_drop_unmapped_for_shopify_ready():
+    products = [{
+        'title': 'Bag',
+        'image_url': 'https://src/a.jpg',
+        'additional_images': ['https://src/b.jpg', 'https://src/c.jpg'],
+        'variants': [
+            {'sku': '1', 'featured_image': 'https://src/a.jpg'},
+            {'sku': '2', 'featured_image': 'https://src/blocked.jpg'},
+        ],
+    }]
+    mapped = rewrite_products_urls(
+        products,
+        {'https://src/a.jpg': 'https://cdn.shopify.com/a.jpg'},
+        drop_unmapped=True,
+    )
+    assert mapped[0]['image_url'] == 'https://cdn.shopify.com/a.jpg'
+    assert mapped[0]['additional_images'] == []
+    assert mapped[0]['variants'][0]['featured_image'] == 'https://cdn.shopify.com/a.jpg'
+    assert mapped[0]['variants'][1]['featured_image'] is None
+
+
 @pytest.mark.asyncio
 async def test_download_dedupes_bytes_and_rejects_html(tmp_path, monkeypatch):
     products = [{

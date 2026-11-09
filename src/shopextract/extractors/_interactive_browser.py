@@ -17,7 +17,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from .._access import ACCESS_BLOCKED, detect_access_block, format_access_blocked
+from .._access import (
+    ACCESS_BLOCKED,
+    AccessBlock,
+    detect_access_block,
+    format_access_blocked,
+    human_action_guidance,
+)
 from .._models import ExtractorResult
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,7 @@ DEFAULT_PROFILE_ROOT = Path('artifacts') / 'browser-profiles'
 
 ProductHook = Callable[[dict], Awaitable[None] | None]
 SnapshotHook = Callable[[bytes, str], Awaitable[None] | None]
+HumanGateHook = Callable[[dict, AccessBlock | None], Awaitable[None] | None]
 
 _product_hook: contextvars.ContextVar[ProductHook | None] = contextvars.ContextVar(
     'interactive_product_hook', default=None,
@@ -34,20 +41,30 @@ _product_hook: contextvars.ContextVar[ProductHook | None] = contextvars.ContextV
 _snapshot_hook: contextvars.ContextVar[SnapshotHook | None] = contextvars.ContextVar(
     'interactive_snapshot_hook', default=None,
 )
+_human_gate_hook: contextvars.ContextVar[HumanGateHook | None] = contextvars.ContextVar(
+    'interactive_human_gate_hook', default=None,
+)
 
 
 def set_live_hooks(
     *,
     on_product: ProductHook | None = None,
     on_snapshot: SnapshotHook | None = None,
+    on_human_gate: HumanGateHook | None = None,
 ):
-    """Install per-task live preview hooks for the interactive browser session."""
-    return _product_hook.set(on_product), _snapshot_hook.set(on_snapshot)
+    """Install per-task live preview / human-gate hooks for the interactive session."""
+    return (
+        _product_hook.set(on_product),
+        _snapshot_hook.set(on_snapshot),
+        _human_gate_hook.set(on_human_gate),
+    )
 
 
-def reset_live_hooks(product_token, snapshot_token) -> None:
+def reset_live_hooks(product_token, snapshot_token, human_token=None) -> None:
     _product_hook.reset(product_token)
     _snapshot_hook.reset(snapshot_token)
+    if human_token is not None:
+        _human_gate_hook.reset(human_token)
 
 
 @dataclass
@@ -86,15 +103,37 @@ def clear_continue(profile_dir: Path) -> None:
         path.unlink()
 
 
-async def wait_for_human(*, profile_dir: Path, timeout: float, prompt: bool = True) -> bool:
+async def _notify_human_gate(action: dict, block: AccessBlock | None) -> None:
+    hook = _human_gate_hook.get()
+    if hook is None:
+        return
+    try:
+        maybe = hook(action, block)
+        if asyncio.iscoroutine(maybe):
+            await maybe
+    except Exception as exc:
+        logger.info('Interactive human-gate hook failed: %s', exc)
+
+
+async def wait_for_human(
+    *,
+    profile_dir: Path,
+    timeout: float,
+    prompt: bool = True,
+    block: AccessBlock | None = None,
+) -> bool:
     """Wait until the operator signals readiness (sentinel file or stdin Enter)."""
     clear_continue(profile_dir)
+    action = human_action_guidance(block.reason if block is not None else None)
+    await _notify_human_gate(action, block)
     if prompt:
+        steps = '\n'.join(f'  {index}. {step}' for index, step in enumerate(action['steps'], start=1))
         print(
-            '\nInteractive browser is open.\n'
-            'If a waiting room/CAPTCHA/login appears, complete it yourself in that window.\n'
-            'Do not ask ProductHarbor to solve challenges.\n'
-            f'When the real collection is visible, press Enter here OR create:\n  {continue_path(profile_dir)}\n',
+            f"\nInteractive browser is open — {action['title']}\n"
+            f'{steps}\n'
+            'ProductHarbor will not solve CAPTCHAs or bypass protections.\n'
+            f'When ready, press Enter here, click Continue in the dashboard, or create:\n'
+            f'  {continue_path(profile_dir)}\n',
             flush=True,
         )
     loop = asyncio.get_running_loop()
@@ -122,6 +161,25 @@ async def wait_for_human(*, profile_dir: Path, timeout: float, prompt: bool = Tr
             stdin_task.cancel()
             with contextlib.suppress(Exception):
                 await stdin_task
+
+
+async def _human_gate(
+    profile: Path,
+    *,
+    block: AccessBlock | None,
+    human_timeout: float,
+    wait_callback,
+) -> bool:
+    """Shared human pause used for collection and product-page gates."""
+    if wait_callback is not None:
+        action = human_action_guidance(block.reason if block is not None else None)
+        await _notify_human_gate(action, block)
+        try:
+            return bool(await wait_callback(profile, block=block))
+        except TypeError:
+            # Older test callbacks accept only profile_dir.
+            return bool(await wait_callback(profile))
+    return await wait_for_human(profile_dir=profile, timeout=human_timeout, block=block)
 
 
 def _same_collection_scope(collection_url: str, candidate: str) -> bool:
@@ -364,9 +422,22 @@ async def run_interactive_collection(
                 try:
                     req_url = response.url
                     ctype = (response.headers or {}).get('content-type', '')
+                    lower_ctype = ctype.lower()
                     lower_url = req_url.lower()
+                    # Cache real image bytes while the headed session can still fetch them.
+                    if response.status == 200 and (
+                        lower_ctype.startswith('image/')
+                        or 'is/image' in lower_url
+                        or any(lower_url.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif'))
+                    ):
+                        try:
+                            from ..dashboard.image_assets import write_image_cache
+                            body = await response.body()
+                            write_image_cache(profile, req_url, body)
+                        except Exception:
+                            pass
                     interesting = (
-                        'json' in ctype.lower()
+                        'json' in lower_ctype
                         or any(token in lower_url for token in (
                             'product', 'catalog', 'plp', 'search', 'graphql', 'ajax', 'api',
                         ))
@@ -402,8 +473,10 @@ async def run_interactive_collection(
             await _emit_snapshot(page, label='collection_open')
             block = detect_access_block(url=page.url, status=status, body=html)
             if block is not None:
-                ready = await (wait_callback(profile) if wait_callback else wait_for_human(
-                    profile_dir=profile, timeout=human_timeout))
+                await _emit_snapshot(page, label=f'human_gate_{block.reason}')
+                ready = await _human_gate(
+                    profile, block=block, human_timeout=human_timeout, wait_callback=wait_callback,
+                )
                 if not ready:
                     result.blocked = True
                     result.block_message = format_access_blocked(block) + ' (human gate timed out)'
@@ -411,6 +484,7 @@ async def run_interactive_collection(
                         'status': status,
                         'final_url': page.url,
                         'network_samples': network_samples[:8],
+                        'human_action': human_action_guidance(block.reason),
                     })
                     await _emit_snapshot(page, label='blocked_timeout')
                     return result
@@ -419,6 +493,8 @@ async def run_interactive_collection(
                     await page.wait_for_load_state('domcontentloaded', timeout=15000)
                 except Exception:
                     pass
+                with contextlib.suppress(Exception):
+                    await page.reload(wait_until='domcontentloaded', timeout=navigation_timeout_ms)
                 html = await page.content()
                 status = None
                 block = detect_access_block(url=page.url, status=status, body=html)
@@ -431,6 +507,7 @@ async def run_interactive_collection(
                         'final_url': page.url,
                         'status_after_human': status,
                         'network_samples': network_samples[:8],
+                        'human_action': human_action_guidance(block.reason),
                     })
                     return result
 
@@ -526,10 +603,35 @@ async def run_interactive_collection(
                     result.pages_visited += 1
                     await _emit_snapshot(page, label=f'product_{result.pages_visited}')
                     if page_block is not None:
-                        result.blocked = True
-                        result.block_message = format_access_blocked(page_block)
-                        result.evidence['blocked_product_url'] = page.url
-                        break
+                        await _emit_snapshot(page, label=f'product_human_gate_{page_block.reason}')
+                        ready = await _human_gate(
+                            profile,
+                            block=page_block,
+                            human_timeout=min(human_timeout, 180.0),
+                            wait_callback=wait_callback,
+                        )
+                        if not ready:
+                            result.blocked = True
+                            result.block_message = (
+                                format_access_blocked(page_block) + ' (product human gate timed out)'
+                            )
+                            result.evidence['blocked_product_url'] = page.url
+                            break
+                        try:
+                            await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                        except Exception:
+                            pass
+                        with contextlib.suppress(Exception):
+                            await page.reload(wait_until='domcontentloaded', timeout=navigation_timeout_ms)
+                        body = await page.content()
+                        page_block = detect_access_block(url=page.url, status=None, body=body)
+                        await _emit_snapshot(page, label=f'product_after_human_{result.pages_visited}')
+                        if page_block is not None:
+                            result.blocked = True
+                            result.block_message = format_access_blocked(page_block)
+                            result.evidence['blocked_product_url'] = page.url
+                            result.evidence['human_action'] = human_action_guidance(page_block.reason)
+                            break
                     record = extract_product_record(body, page.url)
                     if record is not None:
                         record['_capture'] = {

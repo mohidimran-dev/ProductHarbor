@@ -492,6 +492,31 @@ body {
   gap: 0.7rem;
 }
 
+.human-gate {
+  margin-top: 1rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--orange) 12%, var(--glass-strong));
+}
+
+.human-gate h4 {
+  margin: 0 0 0.55rem;
+  font-size: 1rem;
+  color: var(--ink);
+}
+
+.human-gate ol {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+.human-gate .note {
+  margin-top: 0.7rem;
+}
+
 .note,
 .message {
   color: var(--muted);

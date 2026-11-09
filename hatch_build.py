@@ -9,9 +9,11 @@ def prepared_resource(root):
     try:
         spec=importlib.util.spec_from_file_location('shopify_resource_verifier',package/'resource.py')
         verifier=importlib.util.module_from_spec(spec);spec.loader.exec_module(verifier)
-        pin=json.loads((package/'pin.json').read_text())
+        pin=json.loads((package/'pin.json').read_text(encoding='utf-8'))
         embedded=package/'data'
         directory=embedded if (embedded/'manifest.json').is_file() else root/'build/shopify-taxonomy/catalogs'/pin['release']/pin['fingerprint']
+        # Pin fingerprint is authoritative; compressed resource_sha256 is a reference
+        # classic-zlib bitstream (may differ under zlib-ng — see resource.py).
         verifier.verify_resource_files(directory,expected=pin)
         return directory
     except (ValueError,OSError,ImportError,AttributeError) as error:

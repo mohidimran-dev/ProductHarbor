@@ -1,6 +1,5 @@
 """Explicit offline release normalization; optional YAML dependency stays here."""
 from dataclasses import asdict
-import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -9,7 +8,7 @@ import tempfile
 
 from .contracts import TaxonomyIntegrityError,TaxonomyManifest,StagedTaxonomy
 from .identity import NAMESPACE,canonical,fingerprint
-from .resource import read_gzip,verify_resource_files
+from .resource import read_gzip,verify_resource_files,write_reproducible_gzip
 from .validation import validate_catalog
 
 
@@ -40,7 +39,7 @@ def build_shopify_taxonomy(download, *, staging_root):
         raise TaxonomyIntegrityError('Pinned source hash mismatch')
     if Path(download.extensions_path).stat().st_size>8*1024*1024 or Path(download.license_path).stat().st_size>8192:
         raise TaxonomyIntegrityError('Supplemental source byte cap exceeded')
-    yaml_data=yaml.safe_load(Path(download.extensions_path).read_text())
+    yaml_data=yaml.safe_load(Path(download.extensions_path).read_text(encoding='utf-8'))
     # Keep only alias/ID metadata before loading the large full JSON source.
     bases=_unique([{'id':a['id'],'friendly_id':a['friendly_id']} for a in yaml_data['base_attributes']],
                   'friendly_id','base attribute friendly ID')
@@ -110,12 +109,14 @@ def build_shopify_taxonomy(download, *, staging_root):
     staging_root=Path(staging_root);staging_root.mkdir(parents=True,exist_ok=True)
     directory=Path(tempfile.mkdtemp(prefix='staged-',dir=staging_root))
     try:
-        with (directory/'catalog.json.gz').open('wb') as output:
-            with gzip.GzipFile(fileobj=output,mode='wb',mtime=0,filename='') as compressor:
-                compressor.write(canonical(data))
+        # Record the actual local bitstream hash in the manifest (self-describing).
+        # pin.resource_sha256 remains the reference classic-zlib artifact from the
+        # original Linux release; verification accepts zlib-ng divergence only after
+        # the decoded fingerprint matches that pin (enforced in prepare/hatch).
+        resource_sha=write_reproducible_gzip(directory/'catalog.json.gz', canonical(data))
         shutil.copyfile(download.license_path,directory/'LICENSE')
         record=asdict(manifest)
-        record.update(resource_sha256=_hash(directory/'catalog.json.gz'),license_sha256=source.license_sha256)
+        record.update(resource_sha256=resource_sha,license_sha256=source.license_sha256)
         (directory/'manifest.json').write_bytes(canonical(record))
         verify_resource_files(directory)
     except BaseException:

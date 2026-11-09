@@ -234,11 +234,19 @@ async def test_interactive_continue_writes_sentinel(client):
     cont_seen = asyncio.Event()
 
     async def waiting_extract(url, **kwargs):
-        from shopextract.extractors._interactive_browser import continue_path, clear_continue
+        from shopextract._access import human_action_guidance
+        from shopextract.extractors._interactive_browser import (
+            _human_gate_hook,
+            continue_path,
+            clear_continue,
+        )
         # Resolve profile from the live job after start.
         job = next(iter(_app['jobs'].jobs.values()))
         profile = Path(job.browser_profile_dir)
         clear_continue(profile)
+        gate = _human_gate_hook.get()
+        assert gate is not None
+        gate(human_action_guidance('waiting_interstitial'), None)
         started.set()
         deadline = asyncio.get_event_loop().time() + 4
         while asyncio.get_event_loop().time() < deadline:
@@ -269,10 +277,15 @@ async def test_interactive_continue_writes_sentinel(client):
     assert payload['ok'] is True
     assert payload['job']['interactive_browser'] is True
     assert payload['job']['browser_profile_dir']
+    assert payload['job']['human_action']['title']
     job_id = payload['job']['job_id']
     await asyncio.wait_for(started.wait(), timeout=2)
+    mid = await (await test_client.get(f'/api/jobs/{job_id}')).json()
+    assert mid['job']['awaiting_human'] is True
+    assert mid['job']['human_action']['kind'] == 'waiting_interstitial'
     cont = await (await test_client.post(f'/api/jobs/{job_id}/continue')).json()
     assert cont['ok'] is True
+    assert cont['job']['awaiting_human'] is False
     status = await wait_terminal(test_client, job_id, timeout=5)
     assert status['job']['state'] == 'partial'
     assert status['job']['preview'][0]['title'] == 'LV Bag'
