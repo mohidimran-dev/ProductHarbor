@@ -152,9 +152,13 @@ async def wait_for_human(
                 clear_continue(profile_dir)
                 return True
             if stdin_task is not None and stdin_task.done():
-                with contextlib.suppress(Exception):
+                try:
                     stdin_task.result()
-                return True
+                except Exception:
+                    # A closed console is not the operator pressing Enter.
+                    stdin_task = None
+                else:
+                    return True
             await asyncio.sleep(0.4)
         return False
     finally:
@@ -503,10 +507,21 @@ async def run_interactive_collection(
             await _emit_snapshot(page, label='collection_open')
             block = detect_access_block(url=page.url, status=status, body=html)
             if block is not None:
-                await _emit_snapshot(page, label=f'human_gate_{block.reason}')
-                ready = await _human_gate(
+                gate_label = f'human_gate_{block.reason}'
+                await _emit_snapshot(page, label=gate_label)
+                gate_task = asyncio.create_task(_human_gate(
                     profile, block=block, human_timeout=human_timeout, wait_callback=wait_callback,
-                )
+                ))
+                try:
+                    while not gate_task.done():
+                        done, _pending = await asyncio.wait({gate_task}, timeout=3.0)
+                        if not done:
+                            await _emit_snapshot(page, label=gate_label)
+                    ready = gate_task.result()
+                except BaseException:
+                    if not gate_task.done():
+                        gate_task.cancel()
+                    raise
                 if not ready:
                     result.blocked = True
                     result.block_message = format_access_blocked(block) + ' (human gate timed out)'
