@@ -250,21 +250,48 @@ def products_to_shopify_rows(products: Iterable) -> list[dict[str, str]]:
     return rows
 
 
+def shopify_image_url_problem(value: str) -> str | None:
+    """Return why a cell cannot be imported by Shopify's native CSV importer."""
+    lower = value.strip().lower()
+    if not lower:
+        return None
+    forbidden_prefixes = ('file:', 'data:', 'blob:', '/', '\\\\', 'c:\\', 'c:/')
+    if any(lower.startswith(prefix) for prefix in forbidden_prefixes):
+        return 'local_or_data_url'
+    if 'localhost' in lower or '127.0.0.1' in lower:
+        return 'localhost_url'
+    if not lower.startswith('https://') and not lower.startswith('http://'):
+        return 'not_an_http_url'
+    return None
+
+
 def assert_shopify_image_urls_safe(rows: Iterable[dict[str, str]]) -> None:
     """Reject local/file/base64 values that Shopify native CSV cannot import."""
-    forbidden_prefixes = ('file:', 'data:', 'blob:', '/', '\\\\', 'c:\\', 'c:/')
     for row in rows:
         for key in ('Product image URL', 'Variant image URL'):
             value = (row.get(key) or '').strip()
-            if not value:
-                continue
-            lower = value.lower()
-            if any(lower.startswith(prefix) for prefix in forbidden_prefixes):
+            problem = shopify_image_url_problem(value)
+            if problem == 'local_or_data_url':
                 raise ValueError(f'Shopify image column must be an HTTPS URL, not local/data: {key}')
-            if 'localhost' in lower or '127.0.0.1' in lower:
+            if problem == 'localhost_url':
                 raise ValueError(f'Shopify image column must not use localhost: {key}')
-            if not lower.startswith('https://') and not lower.startswith('http://'):
+            if problem == 'not_an_http_url':
                 raise ValueError(f'Shopify image column must be an HTTP(S) URL: {key}')
+
+
+def omit_unimportable_image_urls(rows: list[dict[str, str]]) -> int:
+    """Blank image cells Shopify cannot fetch. Product rows stay in the file."""
+    omitted = 0
+    for row in rows:
+        for key in ('Product image URL', 'Variant image URL'):
+            value = (row.get(key) or '').strip()
+            if value and shopify_image_url_problem(value):
+                row[key] = ''
+                if key == 'Product image URL':
+                    row['Image position'] = ''
+                    row['Image alt text'] = ''
+                omitted += 1
+    return omitted
 
 
 def write_shopify_csv(products: Iterable, path: Path, *, validate_image_urls: bool = True) -> Path:
@@ -272,7 +299,7 @@ def write_shopify_csv(products: Iterable, path: Path, *, validate_image_urls: bo
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = products_to_shopify_rows(products)
     if validate_image_urls:
-        assert_shopify_image_urls_safe(rows)
+        omit_unimportable_image_urls(rows)
     temporary = path.with_suffix(path.suffix + '.tmp')
     with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=SHOPIFY_PRODUCT_HEADERS, extrasaction='ignore')

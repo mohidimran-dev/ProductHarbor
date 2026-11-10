@@ -14,6 +14,29 @@ from shopextract.dashboard.shopify_csv import (
 )
 
 
+def test_collection_target_strips_product_category():
+    from shopextract.extractors.woocommerce import collection_target
+    base, slug = collection_target('https://demo.athemes.com/botiga/product-category/cosmetics/')
+    assert base == 'https://demo.athemes.com/botiga'
+    assert slug == 'cosmetics'
+    root, empty = collection_target('https://demo.athemes.com/botiga')
+    assert root == 'https://demo.athemes.com/botiga'
+    assert empty is None
+
+
+def test_unimportable_image_urls_are_omitted_from_shopify_csv():
+    from shopextract.dashboard.shopify_csv import omit_unimportable_image_urls
+    rows = [{
+        'Product image URL': 'http://127.0.0.1:8766/img/a.jpg',
+        'Variant image URL': 'https://cdn.example/v.jpg',
+        'Image position': '1',
+        'Image alt text': 'A',
+    }]
+    assert omit_unimportable_image_urls(rows) == 1
+    assert rows[0]['Product image URL'] == ''
+    assert rows[0]['Variant image URL'] == 'https://cdn.example/v.jpg'
+
+
 def test_slugify_handle():
     assert slugify_handle('Neverfull MM') == 'neverfull-mm'
     assert slugify_handle('  Alma BB!  ') == 'alma-bb'

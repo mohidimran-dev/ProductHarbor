@@ -331,7 +331,7 @@ class DashboardJobManager:
             job.awaiting_human = False
         except Exception as exc:
             job.state = 'failed'
-            job.message = f'Extraction failed: {type(exc).__name__}'
+            job.message = f'Extraction failed: {type(exc).__name__}: {exc}'
             job.errors = [str(exc)]
             job.outcome = 'failed'
             job.awaiting_human = False

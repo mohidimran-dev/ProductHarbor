@@ -17,6 +17,22 @@ from ._http_defaults import DEFAULT_HEADERS, get_default_user_agent
 logger = logging.getLogger(__name__)
 
 
+def collection_target(shop_url: str) -> tuple[str, str | None]:
+    """Return the Store API origin and a product-category slug, when the URL is one."""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(shop_url.strip())
+    segments = [segment for segment in parts.path.split('/') if segment]
+    slug = None
+    if 'product-category' in segments:
+        index = segments.index('product-category')
+        if index + 1 < len(segments):
+            slug = segments[index + 1]
+        segments = segments[:index]
+    path = '/' + '/'.join(segments)
+    base = urlunsplit((parts.scheme, parts.netloc, path.rstrip('/'), '', '')).rstrip('/')
+    return base, slug
+
+
 class WooCommerceExtractor:
     """Extract products from WooCommerce stores using the public Store API."""
 
@@ -34,7 +50,8 @@ class WooCommerceExtractor:
         from .._execution import register_progress_source
         from .._models import Platform
         register_progress_source(all_products,Platform.WOOCOMMERCE,shop_url)
-        base_url = shop_url.rstrip("/")
+        base_url, category_slug = collection_target(shop_url)
+        category_id: str | None = None
         complete = True
         error: str | None = None
         reason=None
@@ -47,12 +64,33 @@ class WooCommerceExtractor:
         }
 
         async with storefront_client(self.http_client, self.timeout, headers=headers) as client:
+            if category_slug:
+                from urllib.parse import quote
+                lookup = await client.get(
+                    f'{base_url}/wp-json/wc/store/v1/products/categories?slug={quote(category_slug)}'
+                )
+                try:
+                    rows = lookup.json() if lookup.status_code == 200 else None
+                except Exception:
+                    rows = None
+                match = next((row for row in rows if isinstance(row, dict) and row.get('slug') == category_slug), None) if isinstance(rows, list) else None
+                if match is None or match.get('id') is None:
+                    return ExtractorResult(
+                        products=[],
+                        complete=False,
+                        error=f'WooCommerce category {category_slug!r} was not found on {base_url}',
+                        pages_completed=0,
+                        completeness_reason='source_incomplete',
+                    )
+                category_id = str(match['id'])
             page = 1
 
             while page <= self.max_pages:
                 size=min(100,max_products-len(all_products)) if max_products is not None else 100
                 if size<=0:break
                 query=f'per_page={size}&page=1&offset={len(all_products)}&orderby=id&order=asc' if max_products is not None else f'per_page=100&page={page}'
+                if category_id is not None:
+                    query += f'&category={category_id}'
                 url = f'{base_url}/wp-json/wc/store/v1/products?{query}'
                 logger.info("Fetching page %s from %s", page, url)
 
@@ -106,7 +144,10 @@ class WooCommerceExtractor:
                     total_text=response.headers.get('X-WP-Total','')
                     total=int(total_text) if total_text.isascii() and total_text.isdigit() else None
                     exhausted=not clipped and (total is not None and total>=len(all_products) and len(all_products)==total or received<size)
-                    if exhausted:break
+                    if exhausted:
+                        if total is not None and len(all_products) == total:
+                            reason = 'woo_total_confirmed'
+                        break
                     if max_products is not None and len(all_products)>=max_products:
                         complete=False;reason='product_budget_reached';break
                     page+=1

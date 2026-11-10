@@ -225,11 +225,18 @@ async def extract(
                 reasons.append("product_budget_reached")
             if len(products) != len(api_result.products):
                 reasons.append("normalization_dropped_records")
-            # Only Shopify's exhaustion-aware enumeration currently certifies
-            # coverage; the other API and crawl paths remain unverified.
-            if platform != Platform.SHOPIFY:
+            # Shopify page exhaustion and a finished WooCommerce Store API
+            # enumeration (X-WP-Total or a short final page) certify coverage.
+            # Other API and crawl paths stay unverified.
+            certified = platform == Platform.SHOPIFY or (
+                platform == Platform.WOOCOMMERCE
+                and api_result.complete is True
+                and not api_result.error
+                and api_result.completeness_reason == 'woo_total_confirmed'
+            )
+            if not certified:
                 reasons.append("catalog_coverage_unverified")
-            catalog_complete = not reasons if platform == Platform.SHOPIFY else None
+            catalog_complete = not reasons if certified else None
             if any(reason != "catalog_coverage_unverified" for reason in reasons):
                 catalog_complete = False
             return ExtractionResult(
@@ -561,7 +568,7 @@ async def _extract_interactive_collection(
         products.append(product)
 
     from ._dedupe import dedupe_products
-    products, _dedupe_stats = dedupe_products(products, store=shop_url or url)
+    products, dedupe_stats = dedupe_products(products, store=shop_url or url)
 
     reasons = []
     if extractor.completeness_reason:
@@ -574,14 +581,12 @@ async def _extract_interactive_collection(
         reasons = [ACCESS_BLOCKED]
     elif extractor.complete and products and not reasons:
         catalog_complete = True
-    evidence_note = None
-    if session_meta.get('pagination_end_confirmed') is not None:
-        evidence_note = f"pagination_end_confirmed={session_meta['pagination_end_confirmed']}"
     errors = list(api_errors)
     if extractor.error:
         errors.append(extractor.error)
-    if evidence_note and extractor.completeness_reason != ACCESS_BLOCKED:
-        errors.append(evidence_note)
+    # A confirmed end is evidence of success. Only an unconfirmed end is an error.
+    if session_meta.get('pagination_end_confirmed') is False and extractor.completeness_reason != ACCESS_BLOCKED:
+        errors.append('pagination_end_confirmed=False')
     return ExtractionResult(
         observation_scope=observation_scope,
         catalog_complete=catalog_complete,
@@ -594,6 +599,10 @@ async def _extract_interactive_collection(
         urls_attempted=max(extractor.pages_completed or 0, len(extractor.products), 1),
         urls_succeeded=len(products),
         errors=errors,
+        http_pages=session_meta.get('pages_visited') if session_meta.get('pages_visited') is not None else extractor.pages_completed,
+        products_discovered=len(session_meta.get('product_urls') or []),
+        products_failed=session_meta.get('failed_pages'),
+        duplicates_merged=dedupe_stats.duplicate_product_observations_merged,
     )
 
 

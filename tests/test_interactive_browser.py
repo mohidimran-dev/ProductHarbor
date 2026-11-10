@@ -82,6 +82,70 @@ def test_extract_product_record_returns_none_without_title():
     assert ib.extract_product_record('<html><body>empty</body></html>', PRODUCT_A) is None
 
 
+def test_finite_collection_without_next_page_is_confirmed():
+    confirmed, note = ib.decide_collection_end(
+        discovered=24,
+        requested=1000,
+        notes=['no_load_more_control_found'],
+        next_href=None,
+    )
+    assert confirmed is True
+    assert note == 'collection_end_confirmed_no_further_page'
+
+
+def test_remaining_next_page_stays_unconfirmed():
+    confirmed, note = ib.decide_collection_end(
+        discovered=24,
+        requested=1000,
+        notes=['no_load_more_control_found'],
+        next_href='https://shop.example/collections/shoes?page=2',
+    )
+    assert confirmed is None
+    assert note == 'pagination_end_unconfirmed'
+
+
+def test_product_budget_is_not_treated_as_catalog_end():
+    confirmed, note = ib.decide_collection_end(
+        discovered=1000,
+        requested=1000,
+        notes=['no_load_more_control_found'],
+        next_href=None,
+    )
+    assert confirmed is False
+    assert note == 'hit_product_budget_end_unconfirmed'
+
+
+def test_failed_next_navigation_stays_unconfirmed():
+    confirmed, note = ib.decide_collection_end(
+        discovered=24,
+        requested=1000,
+        notes=['next_page_navigation_failed'],
+        next_href=None,
+    )
+    assert confirmed is None
+
+
+def test_extract_product_record_reads_multiple_published_offers_as_variants():
+    payload = json.dumps({
+        '@type': 'Product',
+        'name': 'Runner',
+        'offers': {
+            '@type': 'AggregateOffer',
+            'lowPrice': '100.00',
+            'priceCurrency': 'USD',
+            'offers': [
+                {'@type': 'Offer', 'name': 'Size 8', 'sku': 'R-8', 'price': '100.00', 'priceCurrency': 'USD'},
+                {'@type': 'Offer', 'name': 'Size 9', 'sku': 'R-9', 'price': '110.00', 'priceCurrency': 'USD'},
+            ],
+        },
+    })
+    html = f'<html><head><script type="application/ld+json">{payload}</script></head></html>'
+    record = ib.extract_product_record(html, PRODUCT_A)
+    assert record is not None
+    assert record['price'] == '100.00'
+    assert [item['sku'] for item in record['variants']] == ['R-8', 'R-9']
+
+
 def test_interactive_browser_enabled_requires_both_flags():
     with execution_policy(ExecutionPolicy(browser=True, interactive_browser=False)):
         assert interactive_browser_enabled() is False
@@ -171,6 +235,9 @@ async def test_extract_uses_interactive_path_and_skips_http_probe(monkeypatch):
     assert result.products[0].sku == 'M40156'
     assert result.products[0].variants[0].sku == 'M40156-BR'
     assert 'ACCESS_BLOCKED' not in result.incompleteness_reasons
+    assert result.catalog_complete is True
+    assert result.errors == []
+    assert result.outcome == 'complete'
 
 
 @pytest.mark.asyncio

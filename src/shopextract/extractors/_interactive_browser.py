@@ -76,6 +76,7 @@ class InteractiveSessionResult:
     product_urls: list[str] = field(default_factory=list)
     products: list[dict] = field(default_factory=list)
     pages_visited: int = 0
+    failed_pages: int = 0
     pagination_end_confirmed: bool | None = None
     pagination_notes: list[str] = field(default_factory=list)
     evidence: dict = field(default_factory=dict)
@@ -302,6 +303,19 @@ def extract_product_record(html: str, page_url: str) -> dict | None:
             images.append(image['url'])
         offers = product.get('offers')
         offer_list = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
+        # AggregateOffer wraps the real purchasable offers.
+        flattened: list[dict] = []
+        for offer in offer_list:
+            if not isinstance(offer, dict):
+                continue
+            nested = offer.get('offers')
+            if isinstance(nested, list) and nested and all(isinstance(item, dict) for item in nested):
+                flattened.extend(nested)
+            elif isinstance(nested, dict):
+                flattened.append(nested)
+            else:
+                flattened.append(offer)
+        offer_list = flattened or offer_list
         for offer in offer_list:
             if not isinstance(offer, dict):
                 continue
@@ -311,6 +325,22 @@ def extract_product_record(html: str, page_url: str) -> dict | None:
                 currency = offer.get('priceCurrency')
             if sku is None and isinstance(offer.get('sku'), str):
                 sku = offer.get('sku')
+        # A published list of offers is the variant set when hasVariant is absent.
+        if len([offer for offer in offer_list if isinstance(offer, dict)]) > 1:
+            for offer in offer_list:
+                if not isinstance(offer, dict):
+                    continue
+                variants.append({
+                    'title': offer.get('name') if isinstance(offer.get('name'), str) else (
+                        offer.get('sku') if isinstance(offer.get('sku'), str) else None
+                    ),
+                    'sku': offer.get('sku') if isinstance(offer.get('sku'), str) else None,
+                    'price': str(offer.get('price')) if offer.get('price') is not None else None,
+                    'currency': offer.get('priceCurrency') if isinstance(offer.get('priceCurrency'), str) else None,
+                    'featured_image': None,
+                    'featured_image_id': None,
+                    'options': {},
+                })
         for key in ('hasVariant', 'model'):
             entries = product.get(key)
             if not isinstance(entries, list):
@@ -536,20 +566,36 @@ async def run_interactive_collection(
                     seen_urls.add(clean)
                     if len(product_urls) >= max_products * 4:
                         break
-            # Attempt in-page load-more / infinite-scroll while under budget; dedupe URLs.
+            # Attempt in-page load-more, scroll, then a real next-page link.
             pagination_notes = []
             load_rounds = 0
+            visited_collections = {collection_clean.rstrip('/')}
             while len(product_urls) < max_products and load_rounds < 8:
                 before = set(product_urls)
                 clicked = await _try_load_more(page)
+                followed = False
                 if clicked:
                     pagination_notes.append(f'clicked_load_more_or_next_round_{load_rounds + 1}')
                 else:
                     scrolled = await _try_scroll_for_more(page)
-                    if not scrolled:
-                        pagination_notes.append('no_load_more_control_found')
-                        break
-                    pagination_notes.append(f'scrolled_for_more_round_{load_rounds + 1}')
+                    if scrolled:
+                        pagination_notes.append(f'scrolled_for_more_round_{load_rounds + 1}')
+                    else:
+                        next_href = await _next_collection_href(page, visited=visited_collections)
+                        if next_href:
+                            try:
+                                await page.goto(next_href, wait_until='domcontentloaded', timeout=navigation_timeout_ms)
+                                await _wait_for_collection_content(page, timeout_ms=12000)
+                                visited_collections.add(next_href.rstrip('/'))
+                                followed = True
+                                pagination_notes.append(f'followed_next_page_round_{load_rounds + 1}')
+                            except Exception as exc:
+                                logger.info('Next collection page failed %s: %s', next_href, exc)
+                                pagination_notes.append('next_page_navigation_failed')
+                                break
+                        else:
+                            pagination_notes.append('no_load_more_control_found')
+                            break
                 load_rounds += 1
                 await asyncio.sleep(1.5)
                 html2 = await page.content()
@@ -560,29 +606,27 @@ async def run_interactive_collection(
                         product_urls.append(item)
                         before.add(item)
                         added += 1
-                if added == 0:
+                if added == 0 and not followed:
                     pagination_notes.append('load_more_yielded_no_additional_unique_urls')
+                    break
+                if added == 0 and followed:
+                    pagination_notes.append('next_page_yielded_no_additional_unique_urls')
                     break
             if load_rounds == 0 and 'no_load_more_control_found' not in pagination_notes:
                 pagination_notes.append('single_page_no_pagination_attempt')
 
             result.product_urls = product_urls[:max_products]
+            next_href = await _next_collection_href(page, visited=visited_collections)
+            confirmed, end_note = decide_collection_end(
+                discovered=len(product_urls),
+                requested=max_products,
+                notes=pagination_notes,
+                next_href=next_href,
+            )
+            result.pagination_end_confirmed = confirmed
             result.pagination_notes = pagination_notes
-            if not product_urls:
-                result.pagination_end_confirmed = False
-                result.pagination_notes.append('no_product_urls_discovered')
-            elif 'load_more_yielded_no_additional_unique_urls' in pagination_notes:
-                result.pagination_end_confirmed = True
-                result.pagination_notes.append('collection_end_confirmed_via_exhausted_load_more')
-            elif len(product_urls) < max_products and 'no_load_more_control_found' in pagination_notes:
-                result.pagination_end_confirmed = None
-                result.pagination_notes.append('fewer_than_requested_urls_end_unconfirmed')
-            elif len(result.product_urls) >= max_products:
-                result.pagination_end_confirmed = False
-                result.pagination_notes.append('hit_product_budget_end_unconfirmed')
-            else:
-                result.pagination_end_confirmed = None
-                result.pagination_notes.append('pagination_end_unconfirmed')
+            if end_note:
+                result.pagination_notes.append(end_note)
 
             result.evidence.update({
                 'final_url': page.url,
@@ -641,8 +685,11 @@ async def run_interactive_collection(
                         }
                         result.products.append(record)
                         await _emit_product(record)
+                    else:
+                        result.failed_pages += 1
                 except Exception as exc:
                     logger.info('Interactive product navigation failed for %s: %s', product_url, exc)
+                    result.failed_pages += 1
                     continue
             return result
         finally:
@@ -721,15 +768,100 @@ def _urls_from_network_body(body: str, base_url: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def decide_collection_end(
+    *,
+    discovered: int,
+    requested: int,
+    notes: list[str],
+    next_href: str | None,
+) -> tuple[bool | None, str]:
+    """Decide whether the visible collection ended, from controls already tried.
+
+    A finite page with no further link is confirmed. A remaining next link, or
+    a hit product cap, is not proof that the catalog ended.
+    """
+    if discovered <= 0:
+        return False, 'no_product_urls_discovered'
+    if discovered >= requested:
+        return False, 'hit_product_budget_end_unconfirmed'
+    if 'next_page_navigation_failed' in notes:
+        return None, 'pagination_end_unconfirmed'
+    if next_href:
+        return None, 'pagination_end_unconfirmed'
+    exhausted = (
+        'no_load_more_control_found' in notes
+        or 'load_more_yielded_no_additional_unique_urls' in notes
+        or 'next_page_yielded_no_additional_unique_urls' in notes
+        or 'single_page_no_pagination_attempt' in notes
+    )
+    if exhausted:
+        return True, 'collection_end_confirmed_no_further_page'
+    return None, 'pagination_end_unconfirmed'
+
+
+_NEXT_HREF_JS = """
+(visited) => {
+  const seen = new Set((visited || []).map((item) => String(item).replace(/\\/$/, '')));
+  const current = location.href.replace(/\\/$/, '');
+  seen.add(current);
+  const abs = (el) => {
+    if (!el) return null;
+    const raw = el.href || el.getAttribute('href');
+    if (!raw || raw.startsWith('javascript:') || raw.startsWith('#')) return null;
+    try { return new URL(raw, location.href).href; } catch (e) { return null; }
+  };
+  const rel = document.querySelector('a[rel~="next"], link[rel~="next"]');
+  const relHref = abs(rel);
+  if (relHref && !seen.has(relHref.replace(/\\/$/, ''))) return relHref;
+  const nodes = [...document.querySelectorAll('a[href], button[href]')];
+  for (const el of nodes) {
+    const text = ((el.getAttribute('aria-label') || el.innerText || '') + '').trim().toLowerCase();
+    if (text === 'next' || text === 'next page' || text.includes('load more') || text.includes('show more') || text.includes('view more')) {
+      const href = abs(el);
+      if (href && !seen.has(href.replace(/\\/$/, ''))) return href;
+    }
+  }
+  let currentPage = 1;
+  try {
+    const query = new URL(location.href).searchParams;
+    const raw = query.get('page') || query.get('paged');
+    if (raw && /^[0-9]+$/.test(raw)) currentPage = parseInt(raw, 10);
+  } catch (e) {}
+  const wanted = String(currentPage + 1);
+  for (const el of document.querySelectorAll('a[href]')) {
+    let nextUrl;
+    try { nextUrl = new URL(el.href, location.href); } catch (e) { continue; }
+    const page = nextUrl.searchParams.get('page') || nextUrl.searchParams.get('paged');
+    if (page === wanted && !seen.has(nextUrl.href.replace(/\\/$/, ''))) return nextUrl.href;
+  }
+  return null;
+}
+"""
+
+
+async def _next_collection_href(page, *, visited: set[str]) -> str | None:
+    try:
+        href = await page.evaluate(_NEXT_HREF_JS, list(visited))
+    except Exception:
+        return None
+    if not isinstance(href, str) or not href.startswith(('http://', 'https://')):
+        return None
+    return href
+
+
 async def _try_load_more(page) -> bool:
     selectors = [
         'button:has-text("Load more")',
         'button:has-text("Show more")',
+        'button:has-text("View more")',
         'a:has-text("Load more")',
+        'a:has-text("Show more")',
+        'a:has-text("View more")',
         'a:has-text("Next")',
         'button[aria-label*="next" i]',
         'a[rel="next"]',
         '[data-testid*="load-more" i]',
+        '[data-testid*="pagination-next" i]',
     ]
     for selector in selectors:
         try:
@@ -747,11 +879,15 @@ async def _try_load_more(page) -> bool:
 
 async def _try_scroll_for_more(page) -> bool:
     try:
-        before = await page.evaluate('() => document.body.scrollHeight')
+        before_height, before_links = await page.evaluate(
+            '() => [document.body.scrollHeight, document.querySelectorAll("a[href]").length]'
+        )
         await page.evaluate('() => window.scrollTo(0, document.body.scrollHeight)')
         await asyncio.sleep(1.2)
-        after = await page.evaluate('() => document.body.scrollHeight')
-        return after > before
+        after_height, after_links = await page.evaluate(
+            '() => [document.body.scrollHeight, document.querySelectorAll("a[href]").length]'
+        )
+        return after_height > before_height or after_links > before_links
     except Exception:
         return False
 
@@ -780,6 +916,7 @@ async def interactive_extractor_result(
             'collection_url': session.collection_url,
             'product_urls': list(session.product_urls),
             'pages_visited': session.pages_visited,
+            'failed_pages': session.failed_pages,
             'pagination_end_confirmed': session.pagination_end_confirmed,
             'pagination_notes': list(session.pagination_notes),
             'evidence': dict(session.evidence),
@@ -794,10 +931,12 @@ async def interactive_extractor_result(
         )
     complete = False
     reason = 'interactive_coverage_unverified'
-    if session.pagination_end_confirmed is True:
-        # End of visible pagination confirmed; catalog_complete still needs product budget care.
-        complete = len(session.products) > 0 and max_products >= len(session.product_urls)
-        reason = None if complete else 'interactive_coverage_unverified'
+    extracted_all = bool(session.products) and len(session.products) == len(session.product_urls)
+    if session.pagination_end_confirmed is True and extracted_all and session.failed_pages == 0:
+        complete = True
+        reason = None
+    elif session.failed_pages:
+        reason = 'interactive_product_pages_failed'
     elif session.pagination_notes:
         reason = session.pagination_notes[-1]
     return ExtractorResult(
