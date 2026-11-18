@@ -9,9 +9,11 @@ from click.testing import CliRunner
 from shopextract._access import (
     ACCESS_BLOCKED,
     AccessBlockedError,
+    denial_reference,
     detect_access_block,
     format_access_blocked,
     human_action_guidance,
+    is_hard_denial,
 )
 from shopextract._extract import extract
 from shopextract._models import Platform
@@ -53,6 +55,19 @@ def test_human_action_guidance_for_waiting_and_captcha():
 def test_detect_plain_403_without_body_markers():
     block = detect_access_block(url=URL, status=403, body='<html></html>')
     assert block is not None and block.reason == 'http_403'
+    assert is_hard_denial(block) is True
+
+
+def test_access_denied_page_is_hard_denial_with_reference():
+    body = (
+        'Access denied. We invite you to return at a later time. '
+        'REF #0.75dac817.1794819823.200497c4'
+    )
+    block = detect_access_block(url=URL, status=200, body=body)
+    assert block is not None
+    assert block.reason == 'access_denied_interstitial'
+    assert is_hard_denial(block) is True
+    assert denial_reference(body) == '#0.75dac817.1794819823.200497c4'
 
 
 def test_empty_200_collection_is_not_access_blocked():

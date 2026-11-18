@@ -20,9 +20,11 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from .._access import (
     ACCESS_BLOCKED,
     AccessBlock,
+    denial_reference,
     detect_access_block,
     format_access_blocked,
     human_action_guidance,
+    is_hard_denial,
 )
 from .._models import ExtractorResult
 
@@ -137,6 +139,7 @@ async def wait_for_human(
             f'  {continue_path(profile_dir)}\n',
             flush=True,
         )
+    from .._execution import pause_execution_deadline
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(1.0, timeout)
     stdin_task = None
@@ -146,6 +149,11 @@ async def wait_for_human(
             stdin_task = asyncio.create_task(asyncio.to_thread(input, ''))
     except Exception:
         stdin_task = None
+    with pause_execution_deadline():
+        return await _wait_for_human_signal(loop, deadline, profile_dir, stdin_task)
+
+
+async def _wait_for_human_signal(loop, deadline, profile_dir: Path, stdin_task) -> bool:
     try:
         while loop.time() < deadline:
             if continue_path(profile_dir).is_file():
@@ -197,6 +205,175 @@ def _same_collection_scope(collection_url: str, candidate: str) -> bool:
     return True
 
 
+# Collection pages link to care guides and help articles that contain "/products/"
+# in the path. Those are not catalog products and must not stop a scrape.
+_NON_PRODUCT_PATHS = (
+    '/faq/',
+    '/help/',
+    '/customer-service/',
+    '/customer-care/',
+    '/pages/',
+    '/blogs/',
+    '/blog/',
+    '/account/',
+    '/stores/',
+    '/magazine/',
+    '/articles/',
+)
+
+
+def _skip_blocked_product(result: InteractiveSessionResult, url: str, block: AccessBlock, *, timed_out: bool) -> None:
+    """Record one blocked product URL and continue the collection."""
+    result.failed_pages += 1
+    note = format_access_blocked(block)
+    if timed_out:
+        note += ' (product human gate timed out)'
+    result.pagination_notes.append(f'skipped_blocked_product:{note}')
+    skipped = result.evidence.setdefault('skipped_product_urls', [])
+    if isinstance(skipped, list):
+        skipped.append(url)
+    result.evidence['blocked_product_url'] = url
+
+
+_FAMILY_ID = re.compile(r'(nvprod[a-z0-9]+)', re.I)
+
+
+def product_family_key(url: str | None) -> str | None:
+    """Louis Vuitton colorways share one nvprod id and differ by the final SKU."""
+    if not isinstance(url, str) or not url:
+        return None
+    match = _FAMILY_ID.search(urlsplit(url).path)
+    return match.group(1).lower() if match else None
+
+
+def _color_label(record: dict) -> str:
+    """Color only when the page published one. A SKU is not a color name."""
+    explicit = record.get('color')
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    for variant in record.get('variants') or []:
+        if not isinstance(variant, dict):
+            continue
+        color = (variant.get('options') or {}).get('Color')
+        if isinstance(color, str) and color.strip():
+            return color.strip()
+    return ''
+
+
+def _rows_for_colorway(record: dict) -> list[dict]:
+    color = _color_label(record)
+    image = record.get('image_url') if isinstance(record.get('image_url'), str) else None
+    size_rows = []
+    for variant in record.get('variants') or []:
+        if not isinstance(variant, dict):
+            continue
+        options = dict(variant.get('options') or {})
+        if not options.get('Size'):
+            continue
+        if color and not options.get('Color'):
+            options['Color'] = color
+        size_rows.append({
+            'title': variant.get('title') or options.get('Size'),
+            'sku': variant.get('sku') if isinstance(variant.get('sku'), str) else record.get('sku'),
+            'price': variant.get('price') if variant.get('price') not in (None, '') else record.get('price'),
+            'currency': variant.get('currency') or record.get('currency'),
+            'featured_image': variant.get('featured_image') or image,
+            'featured_image_id': variant.get('featured_image_id'),
+            'options': options,
+        })
+    if size_rows:
+        return size_rows
+    if not color and not record.get('sku'):
+        return []
+    return [{
+        'title': color or record.get('title'),
+        'sku': record.get('sku') if isinstance(record.get('sku'), str) else None,
+        'price': record.get('price'),
+        'currency': record.get('currency'),
+        'featured_image': image,
+        'featured_image_id': None,
+        'options': {'Color': color} if color else {},
+    }]
+
+
+def merge_colorway_records(records: list[dict]) -> list[dict]:
+    """Keep every color and size of one product family on a single product."""
+    grouped: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        key = product_family_key(record.get('product_url'))
+        token = key or f'single:{index}'
+        if token not in grouped:
+            order.append(token)
+            grouped[token] = []
+        grouped[token].append(record)
+
+    merged: list[dict] = []
+    for token in order:
+        members = grouped[token]
+        if token.startswith('single:') or len(members) == 1 and token.startswith('single:'):
+            merged.append(members[0])
+            continue
+        if not token.startswith('nvprod') or len(members) == 1:
+            # A single colorway stays as scraped. Sizes already on it are kept.
+            merged.append(members[0] if len(members) == 1 else _merge_family(members))
+            continue
+        merged.append(_merge_family(members))
+    return merged
+
+
+def _merge_family(members: list[dict]) -> dict:
+    base = dict(members[0])
+    descriptions = [item.get('description') for item in members if isinstance(item.get('description'), str) and item.get('description').strip()]
+    if descriptions:
+        base['description'] = max(descriptions, key=len)
+    images: list[str] = []
+    for item in members:
+        for url in [item.get('image_url'), *(item.get('additional_images') or []), *(item.get('images') or [])]:
+            if isinstance(url, str) and url and url not in images:
+                images.append(url)
+    if images:
+        base['image_url'] = images[0]
+        base['additional_images'] = images[1:]
+        base['images'] = images
+    rows: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in members:
+        for row in _rows_for_colorway(item):
+            options = row.get('options') or {}
+            identity = (
+                str(options.get('Color') or '').lower(),
+                str(options.get('Size') or '').lower(),
+                str(row.get('sku') or ''),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(row)
+    base['variants'] = rows
+    names: list[str] = []
+    if any((row.get('options') or {}).get('Color') for row in rows):
+        names.append('Color')
+    if any((row.get('options') or {}).get('Size') for row in rows):
+        names.append('Size')
+    base['option_names'] = names
+    family = product_family_key(base.get('product_url'))
+    if family:
+        base['family_id'] = family
+        base['external_id'] = family
+    return base
+
+
+def is_catalog_product_url(url: str) -> bool:
+    """True when the path looks like a product page, not a help or account page."""
+    path = urlsplit(url).path.lower()
+    if '/products/' not in path and '/product/' not in path:
+        return False
+    return not any(marker in path for marker in _NON_PRODUCT_PATHS)
+
+
 def discover_product_urls(html: str, collection_url: str, *, max_urls: int) -> list[str]:
     """Collect product URLs from anchors and JSON-LD; preserve document order; dedupe."""
     from bs4 import BeautifulSoup
@@ -215,10 +392,10 @@ def discover_product_urls(html: str, collection_url: str, *, max_urls: int) -> l
             return
         if not _same_collection_scope(collection_url, clean):
             return
-        path = parts.path.lower()
         # Require a product path segment. Category facet URLs also end in /_/N-...
-        # and must not be treated as products.
-        if '/products/' not in path and '/product/' not in path:
+        # and must not be treated as products. Help pages that merely contain
+        # "/products/" (for example a shoe-care FAQ) are not catalog products.
+        if not is_catalog_product_url(clean):
             return
         seen.add(clean)
         ordered.append(clean)
@@ -264,6 +441,278 @@ def _walk_json(value):
             stack.extend(item)
 
 
+_SHOE_OR_APPAREL_SIZE = re.compile(
+    r'^(?:[3-9]|[1-5]\d)(?:\.[05])?$|^(?:XXS|XS|S|M|L|XL|XXL|XXXL|2XL|3XL)$',
+    re.IGNORECASE,
+)
+_SIZE_TEXT = re.compile(
+    r'^(?:size\s*)?([3-9]|[1-5]\d)(?:\.([05]))?\s*(?:eu|us|uk|it|fr)?$',
+    re.IGNORECASE,
+)
+_ALPHA_SIZE = re.compile(r'^(?:XXS|XS|S|M|L|XL|XXL|XXXL|2XL|3XL)$', re.IGNORECASE)
+_SKU_TOKEN = re.compile(r'^[0-9A-Z]{5,}$')
+
+
+def _text_value(value) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.lower() != 'undefined':
+            return text
+        return None
+    if isinstance(value, dict):
+        for key in ('name', 'value'):
+            text = _text_value(value.get(key))
+            if text:
+                return text
+    return None
+
+
+def _collect_images(image, images: list[str]) -> None:
+    if isinstance(image, str):
+        images.append(image)
+    elif isinstance(image, list):
+        for item in image:
+            _collect_images(item, images)
+    elif isinstance(image, dict) and isinstance(image.get('url'), str):
+        images.append(image['url'])
+
+
+def _schema_options(node: dict | None) -> dict[str, str]:
+    """Published Size/Color labels only. Skip empty or placeholder values."""
+    if not isinstance(node, dict):
+        return {}
+    options: dict[str, str] = {}
+    size = _text_value(node.get('size'))
+    color = _text_value(node.get('color'))
+    if size:
+        options['Size'] = size
+    if color:
+        options['Color'] = color
+    props = node.get('additionalProperty')
+    if isinstance(props, dict):
+        props = [props]
+    if isinstance(props, list):
+        for prop in props:
+            if not isinstance(prop, dict):
+                continue
+            name = _text_value(prop.get('name'))
+            value = _text_value(prop.get('value'))
+            if not name or not value:
+                continue
+            if name.lower() in ('size', 'color') and name.title() not in options:
+                options[name.title()] = value
+            elif name.lower() not in ('dimensions',):
+                options.setdefault(name, value)
+    return options
+
+
+def canonical_page_url(url: str) -> str:
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ('http', 'https') or not parts.netloc:
+        return url.strip()
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip('/'), '', ''))
+
+
+def normalize_size_label(value: str) -> str | None:
+    """Turn 'Size 38', '38 EU', and '39.5' into one size token. Return None when it is not a size."""
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    if not text or len(text) > 24:
+        return None
+    if _ALPHA_SIZE.fullmatch(text):
+        return text.upper()
+    match = _SIZE_TEXT.fullmatch(text)
+    if not match:
+        return None
+    whole, fraction = match.group(1), match.group(2)
+    return f'{int(whole)}.{fraction}' if fraction else str(int(whole))
+
+
+def plausible_color_name(value: str | None, sku: str | None = None) -> str | None:
+    """Keep a swatch label the page printed. Reject SKUs and size tokens."""
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r'\s+', ' ', value).strip()
+    if not text or len(text) > 40 or not re.search(r'[A-Za-z]', text):
+        return None
+    if sku and text.lower() == sku.strip().lower():
+        return None
+    if _SKU_TOKEN.fullmatch(text):
+        return None
+    if normalize_size_label(text):
+        return None
+    return text
+
+
+def _size_key(value: str) -> str:
+    normalized = normalize_size_label(value)
+    if normalized:
+        return normalized.lower()
+    text = value.strip()
+    if re.fullmatch(r'\d+\.0', text):
+        return text[:-2]
+    return text.lower()
+
+
+def apply_published_sizes(record: dict, sizes: list[str]) -> None:
+    """Replace a single selected size with every available size the page listed."""
+    cleaned = []
+    for size in sizes:
+        text = normalize_size_label(str(size))
+        if text and text not in cleaned:
+            cleaned.append(text)
+    existing = [
+        (variant.get('options') or {}).get('Size')
+        for variant in record.get('variants') or []
+        if isinstance(variant, dict)
+    ]
+    published = [size for size in existing if size]
+    if len(cleaned) < 2 and not (len(cleaned) == 1 and not published):
+        return
+    color = None
+    known_size = None
+    known_sku = record.get('sku') if isinstance(record.get('sku'), str) else None
+    for variant in record.get('variants') or []:
+        if not isinstance(variant, dict):
+            continue
+        options = variant.get('options') or {}
+        if not color and isinstance(options.get('Color'), str):
+            color = options['Color']
+        if not known_size and isinstance(options.get('Size'), str):
+            known_size = options['Size']
+        if isinstance(variant.get('sku'), str) and variant.get('sku'):
+            known_sku = variant['sku']
+    rows = []
+    for size in cleaned:
+        matched = bool(known_size) and _size_key(size) == _size_key(known_size)
+        options = {'Size': size}
+        if color:
+            options['Color'] = color
+        rows.append({
+            'title': size,
+            'sku': known_sku if matched else None,
+            'price': record.get('price'),
+            'currency': record.get('currency'),
+            'featured_image': record.get('image_url'),
+            'featured_image_id': None,
+            'options': options,
+        })
+    record['variants'] = rows
+    record['option_names'] = ['Size', 'Color'] if color else ['Size']
+
+
+def _node_unavailable(tag) -> bool:
+    if tag.has_attr('disabled'):
+        return True
+    if str(tag.get('aria-disabled') or '').lower() == 'true':
+        return True
+    classes = ' '.join(tag.get('class') or []).lower()
+    if any(token in classes for token in ('unavailable', 'sold-out', 'soldout', 'out-of-stock', 'disabled')):
+        return True
+    for key in ('data-available', 'data-instock', 'data-available-online'):
+        raw = tag.get(key)
+        if isinstance(raw, str) and raw.strip().lower() in ('false', '0', 'no'):
+            return True
+    return False
+
+
+def sizes_from_html(html: str) -> list[str]:
+    """Available sizes from selects, buttons, and options. Unavailable markup is skipped."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html or '', 'html.parser')
+    sizes: list[str] = []
+    selectors = 'option, button, [role="option"], [role="menuitemradio"], li'
+    for tag in soup.select(selectors):
+        if _node_unavailable(tag):
+            continue
+        chunks = [
+            tag.get('aria-label'),
+            tag.get('title'),
+            tag.get('value'),
+            tag.get_text(' ', strip=True),
+        ]
+        for chunk in chunks:
+            if not isinstance(chunk, str):
+                continue
+            label = normalize_size_label(chunk)
+            if label and label not in sizes:
+                sizes.append(label)
+                break
+    return sizes
+
+
+def color_links_from_html(html: str, page_url: str) -> list[tuple[str, str | None]]:
+    """Color URLs the page itself prints for this nvprod family. No guessed colors."""
+    family = product_family_key(page_url)
+    if not family:
+        return []
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html or '', 'html.parser')
+    found: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all('a', href=True):
+        href = anchor.get('href')
+        if not isinstance(href, str):
+            continue
+        absolute = canonical_page_url(urljoin(page_url, href))
+        if product_family_key(absolute) != family or absolute in seen:
+            continue
+        if not is_catalog_product_url(absolute):
+            continue
+        seen.add(absolute)
+        label = plausible_color_name(
+            anchor.get('aria-label') if isinstance(anchor.get('aria-label'), str) else None,
+        ) or plausible_color_name(
+            anchor.get('title') if isinstance(anchor.get('title'), str) else None,
+        ) or plausible_color_name(anchor.get_text(' ', strip=True))
+        found.append((absolute, label))
+    return found
+
+
+def _stamp_family(record: dict) -> dict:
+    family = product_family_key(record.get('product_url'))
+    if family:
+        record['family_id'] = family
+        record['external_id'] = family
+    return record
+
+
+def _apply_color_name(record: dict, label: str | None) -> None:
+    name = plausible_color_name(label, record.get('sku') if isinstance(record.get('sku'), str) else None)
+    if not name or _color_label(record):
+        return
+    record['color'] = name
+    variants = record.get('variants') or []
+    if not variants:
+        record['variants'] = [{
+            'title': name,
+            'sku': record.get('sku') if isinstance(record.get('sku'), str) else None,
+            'price': record.get('price'),
+            'currency': record.get('currency'),
+            'featured_image': record.get('image_url'),
+            'featured_image_id': None,
+            'options': {'Color': name},
+        }]
+        return
+    for variant in variants:
+        if isinstance(variant, dict):
+            options = dict(variant.get('options') or {})
+            options.setdefault('Color', name)
+            variant['options'] = options
+
+
+async def _read_published_sizes(page) -> list[str]:
+    """Read size choices the storefront shows, including a closed size dropdown."""
+    try:
+        button = page.get_by_role('button', name=re.compile(r'select your size|size', re.I))
+        if await button.count():
+            await button.first.click(timeout=3000)
+            await page.wait_for_timeout(400)
+        html = await page.content()
+    except Exception:
+        return []
+    return sizes_from_html(html)
+
+
 def extract_product_record(html: str, page_url: str) -> dict | None:
     """Pull published fields from JSON-LD/OpenGraph only; leave missing as null."""
     from bs4 import BeautifulSoup
@@ -298,13 +747,7 @@ def extract_product_record(html: str, page_url: str) -> dict | None:
         title = product.get('name') if isinstance(product.get('name'), str) else None
         description = product.get('description') if isinstance(product.get('description'), str) else None
         sku = product.get('sku') if isinstance(product.get('sku'), str) else None
-        image = product.get('image')
-        if isinstance(image, str):
-            images.append(image)
-        elif isinstance(image, list):
-            images.extend(i for i in image if isinstance(i, str))
-        elif isinstance(image, dict) and isinstance(image.get('url'), str):
-            images.append(image['url'])
+        _collect_images(product.get('image'), images)
         offers = product.get('offers')
         offer_list = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
         # AggregateOffer wraps the real purchasable offers.
@@ -343,7 +786,7 @@ def extract_product_record(html: str, page_url: str) -> dict | None:
                     'currency': offer.get('priceCurrency') if isinstance(offer.get('priceCurrency'), str) else None,
                     'featured_image': None,
                     'featured_image_id': None,
-                    'options': {},
+                    'options': _schema_options(offer) or _schema_options(product),
                 })
         for key in ('hasVariant', 'model'):
             entries = product.get(key)
@@ -373,7 +816,20 @@ def extract_product_record(html: str, page_url: str) -> dict | None:
                     variant['featured_image'] = v_image
                 elif isinstance(v_image, dict) and isinstance(v_image.get('url'), str):
                     variant['featured_image'] = v_image.get('url')
+                variant['options'] = _schema_options(entry) or _schema_options(product)
                 variants.append(variant)
+        if not variants:
+            options = _schema_options(product)
+            if options:
+                variants.append({
+                    'title': None,
+                    'sku': sku,
+                    'price': price,
+                    'currency': currency,
+                    'featured_image': images[0] if images else None,
+                    'featured_image_id': None,
+                    'options': options,
+                })
 
     # Open Graph fallbacks for missing published fields only.
     og = {}
@@ -418,6 +874,39 @@ def extract_product_record(html: str, page_url: str) -> dict | None:
     }
 
 
+def _finish_denial(result: InteractiveSessionResult, block: AccessBlock, body: str, *, completed: int) -> None:
+    """Record a hard denial and stop. Does not retry and does not keep a partial family."""
+    from datetime import datetime, timezone
+    reference = denial_reference(body)
+    result.blocked = True
+    result.block_message = format_access_blocked(block)
+    if reference:
+        result.block_message += f' reference={reference}'
+    detected_at = datetime.now(timezone.utc).isoformat()
+    result.evidence['denial'] = {
+        'url': block.url,
+        'status': block.status,
+        'reason': block.reason,
+        'reference': reference,
+        'completed_products': completed,
+        'detected_at': detected_at,
+    }
+    result.evidence['human_action'] = human_action_guidance(block.reason)
+    result.evidence['final_url'] = block.url
+    logger.info(
+        'Denial detected completed=%s url=%s reference=%s at=%s',
+        completed, block.url, reference or '', detected_at,
+    )
+
+
+async def _pause_between_pages(delay_range: tuple[float, float]) -> None:
+    low, high = delay_range
+    if high <= 0:
+        return
+    import random
+    await asyncio.sleep(random.uniform(min(low, high), max(low, high)))
+
+
 async def run_interactive_collection(
     url: str,
     *,
@@ -426,12 +915,22 @@ async def run_interactive_collection(
     human_timeout: float = 300.0,
     navigation_timeout_ms: int = 60000,
     wait_callback=None,
+    delay_range: tuple[float, float] | None = None,
 ) -> InteractiveSessionResult:
     """Open headed persistent Chromium, wait for human, then scrape if cleared."""
     from .._execution import browser_allowed
     if not browser_allowed():
         raise RuntimeError('Browser execution is disabled by the operation policy')
 
+    from ..run_control import current_known_families, current_pace
+    pace = current_pace()
+    if delay_range is None:
+        delay_range = (0.0, 0.0) if pace is None else (pace.delay_min_seconds, pace.delay_max_seconds)
+    known_families = {item.lower() for item in current_known_families()}
+    logger.info(
+        'Interactive run starting url=%s max_products=%s delay=%s-%ss known_families=%s',
+        url, max_products, delay_range[0], delay_range[1], len(known_families),
+    )
     profile = Path(profile_dir or default_profile_dir(url))
     profile.mkdir(parents=True, exist_ok=True)
     result = InteractiveSessionResult(blocked=False, collection_url=url, evidence={'profile_dir': str(profile)})
@@ -447,7 +946,6 @@ async def run_interactive_collection(
             user_data_dir=str(profile),
             headless=False,
             viewport={'width': 1365, 'height': 900},
-            args=['--disable-blink-features=AutomationControlled'],
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
@@ -501,11 +999,39 @@ async def run_interactive_collection(
             page.on('response', _on_response)
             with contextlib.suppress(Exception):
                 await page.bring_to_front()
+            page_cache: dict[str, str] = {}
+
+            async def open_url(target: str):
+                """Open one URL in this browser. Cached URLs are not opened again."""
+                key = canonical_page_url(target)
+                if key in page_cache:
+                    return page_cache[key], None
+                await _pause_between_pages(delay_range)
+                response = await page.goto(target, wait_until='domcontentloaded', timeout=navigation_timeout_ms)
+                body = await page.content()
+                status = response.status if response is not None else None
+                block = detect_access_block(url=page.url, status=status, body=body)
+                result.pages_visited += 1
+                if is_hard_denial(block):
+                    return body, block
+                page_cache[key] = body
+                page_cache[canonical_page_url(page.url)] = body
+                return body, None
+
+            await _pause_between_pages(delay_range)
             response = await page.goto(url, wait_until='domcontentloaded', timeout=navigation_timeout_ms)
             status = response.status if response is not None else None
             html = await page.content()
+            result.pages_visited += 1
             await _emit_snapshot(page, label='collection_open')
             block = detect_access_block(url=page.url, status=status, body=html)
+            if is_hard_denial(block):
+                _finish_denial(result, block, html, completed=0)
+                await _emit_snapshot(page, label='access_denied')
+                return result
+            if block is None:
+                page_cache[canonical_page_url(url)] = html
+                page_cache[canonical_page_url(page.url)] = html
             if block is not None:
                 gate_label = f'human_gate_{block.reason}'
                 await _emit_snapshot(page, label=gate_label)
@@ -544,6 +1070,11 @@ async def run_interactive_collection(
                 status = None
                 block = detect_access_block(url=page.url, status=status, body=html)
                 await _emit_snapshot(page, label='after_human')
+                if is_hard_denial(block):
+                    _finish_denial(result, block, html, completed=0)
+                    result.collection_html = html[:200000]
+                    await _emit_snapshot(page, label='access_denied')
+                    return result
                 if block is not None:
                     result.blocked = True
                     result.block_message = format_access_blocked(block)
@@ -585,7 +1116,10 @@ async def run_interactive_collection(
             pagination_notes = []
             load_rounds = 0
             visited_collections = {collection_clean.rstrip('/')}
-            while len(product_urls) < max_products and load_rounds < 8:
+            while len(product_urls) < max_products and load_rounds < 40:
+                if _crawl_budget_low():
+                    pagination_notes.append('operation_timeout')
+                    break
                 before = set(product_urls)
                 clicked = await _try_load_more(page)
                 followed = False
@@ -598,15 +1132,38 @@ async def run_interactive_collection(
                     else:
                         next_href = await _next_collection_href(page, visited=visited_collections)
                         if next_href:
-                            try:
-                                await page.goto(next_href, wait_until='domcontentloaded', timeout=navigation_timeout_ms)
-                                await _wait_for_collection_content(page, timeout_ms=12000)
+                            opened = False
+                            nav_error = None
+                            await _pause_between_pages(delay_range)
+                            for _attempt in range(2):
+                                try:
+                                    await page.goto(
+                                        next_href,
+                                        wait_until='domcontentloaded',
+                                        timeout=navigation_timeout_ms,
+                                    )
+                                    await _wait_for_collection_content(page, timeout_ms=12000)
+                                    opened = True
+                                    break
+                                except Exception as exc:
+                                    nav_error = exc
+                                    if not _is_navigation_timeout(exc):
+                                        break
+                            if opened:
+                                next_html = await page.content()
+                                next_block = detect_access_block(url=page.url, status=None, body=next_html)
+                                if is_hard_denial(next_block):
+                                    _finish_denial(result, next_block, next_html, completed=len(result.products))
+                                    pagination_notes.append('access_denied')
+                                    break
                                 visited_collections.add(next_href.rstrip('/'))
                                 followed = True
                                 pagination_notes.append(f'followed_next_page_round_{load_rounds + 1}')
-                            except Exception as exc:
-                                logger.info('Next collection page failed %s: %s', next_href, exc)
+                            else:
+                                logger.info('Next collection page failed %s: %s', next_href, nav_error)
                                 pagination_notes.append('next_page_navigation_failed')
+                                if nav_error is not None and _is_navigation_timeout(nav_error):
+                                    pagination_notes.append('operation_timeout')
                                 break
                         else:
                             pagination_notes.append('no_load_more_control_found')
@@ -630,7 +1187,10 @@ async def run_interactive_collection(
             if load_rounds == 0 and 'no_load_more_control_found' not in pagination_notes:
                 pagination_notes.append('single_page_no_pagination_attempt')
 
-            result.product_urls = product_urls[:max_products]
+            result.product_urls = list(product_urls)
+            if result.blocked:
+                result.pagination_notes = pagination_notes
+                return result
             next_href = await _next_collection_href(page, visited=visited_collections)
             confirmed, end_note = decide_collection_end(
                 discovered=len(product_urls),
@@ -653,59 +1213,90 @@ async def run_interactive_collection(
                 'html_length': len(html or ''),
             })
 
+            family_queue: list[tuple[str, str]] = []
+            seen_families: set[str] = set()
+            skipped_existing = 0
             for product_url in result.product_urls:
+                family = product_family_key(product_url)
+                token = family or canonical_page_url(product_url)
+                if token in seen_families:
+                    continue
+                seen_families.add(token)
+                if family and family in known_families:
+                    skipped_existing += 1
+                    logger.info('Skipping family %s because Shopify already has it', family)
+                    continue
+                family_queue.append((token, product_url))
+            batch = family_queue[:max_products]
+            remaining = max(0, len(family_queue) - len(batch))
+            result.evidence['families_discovered'] = len(seen_families)
+            result.evidence['families_skipped_existing'] = skipped_existing
+            result.evidence['families_remaining'] = remaining
+            logger.info(
+                'Families discovered=%s skipped_existing=%s this_batch=%s remaining=%s',
+                len(seen_families), skipped_existing, len(batch), remaining,
+            )
+
+            for token, product_url in batch:
+                if _crawl_budget_low():
+                    result.pagination_notes.append('operation_timeout')
+                    result.pagination_end_confirmed = False
+                    break
                 try:
-                    resp = await page.goto(product_url, wait_until='domcontentloaded', timeout=navigation_timeout_ms)
-                    body = await page.content()
-                    page_status = resp.status if resp is not None else None
-                    page_block = detect_access_block(url=page.url, status=page_status, body=body)
-                    result.pages_visited += 1
+                    body, page_block = await open_url(product_url)
                     await _emit_snapshot(page, label=f'product_{result.pages_visited}')
-                    if page_block is not None:
-                        await _emit_snapshot(page, label=f'product_human_gate_{page_block.reason}')
-                        ready = await _human_gate(
-                            profile,
-                            block=page_block,
-                            human_timeout=min(human_timeout, 180.0),
-                            wait_callback=wait_callback,
-                        )
-                        if not ready:
-                            result.blocked = True
-                            result.block_message = (
-                                format_access_blocked(page_block) + ' (product human gate timed out)'
-                            )
-                            result.evidence['blocked_product_url'] = page.url
-                            break
-                        try:
-                            await page.wait_for_load_state('domcontentloaded', timeout=15000)
-                        except Exception:
-                            pass
-                        with contextlib.suppress(Exception):
-                            await page.reload(wait_until='domcontentloaded', timeout=navigation_timeout_ms)
-                        body = await page.content()
-                        page_block = detect_access_block(url=page.url, status=None, body=body)
-                        await _emit_snapshot(page, label=f'product_after_human_{result.pages_visited}')
-                        if page_block is not None:
-                            result.blocked = True
-                            result.block_message = format_access_blocked(page_block)
-                            result.evidence['blocked_product_url'] = page.url
-                            result.evidence['human_action'] = human_action_guidance(page_block.reason)
-                            break
-                    record = extract_product_record(body, page.url)
-                    if record is not None:
-                        record['_capture'] = {
-                            **(record.get('_capture') or {}),
-                            'collection_url': result.collection_url,
-                            'network_hit_count': len(network_samples),
-                        }
-                        result.products.append(record)
-                        await _emit_product(record)
-                    else:
+                    if is_hard_denial(page_block):
+                        _finish_denial(result, page_block, body, completed=len(result.products))
+                        await _emit_snapshot(page, label='access_denied')
+                        break
+                    record = extract_product_record(body, page.url or product_url)
+                    if record is None:
                         result.failed_pages += 1
+                        continue
+                    apply_published_sizes(record, sizes_from_html(body) or await _read_published_sizes(page))
+                    color_pages = [(canonical_page_url(product_url), None)]
+                    for link, label in color_links_from_html(body, page.url or product_url):
+                        if all(link != existing for existing, _label in color_pages):
+                            color_pages.append((link, label))
+                    color_records = [record]
+                    first_label = next((label for link, label in color_links_from_html(body, page.url or product_url) if link == canonical_page_url(page.url or product_url)), None)
+                    _apply_color_name(record, first_label)
+                    denied_family = False
+                    for link, label in color_pages[1:]:
+                        color_body, color_block = await open_url(link)
+                        if is_hard_denial(color_block):
+                            denied_family = True
+                            _finish_denial(result, color_block, color_body, completed=len(result.products))
+                            await _emit_snapshot(page, label='access_denied')
+                            break
+                        color_record = extract_product_record(color_body, link)
+                        if color_record is None:
+                            continue
+                        apply_published_sizes(color_record, sizes_from_html(color_body))
+                        _apply_color_name(color_record, label)
+                        color_records.append(color_record)
+                    if denied_family:
+                        logger.info('Family %s was not uploaded because a color page was denied', token)
+                        break
+                    merged_set = merge_colorway_records(color_records)
+                    merged = _stamp_family(merged_set[0] if merged_set else record)
+                    merged['_capture'] = {
+                        **(merged.get('_capture') or {}),
+                        'collection_url': result.collection_url,
+                        'network_hit_count': len(network_samples),
+                        'color_pages': len(color_records),
+                    }
+                    result.products.append(merged)
+                    await _emit_product(merged)
+                    logger.info('Product completed family=%s title=%s colors=%s', token, merged.get('title'), len(color_records))
                 except Exception as exc:
                     logger.info('Interactive product navigation failed for %s: %s', product_url, exc)
                     result.failed_pages += 1
                     continue
+            logger.info(
+                'Interactive run finished completed=%s failed=%s denied=%s remaining=%s',
+                len(result.products), result.failed_pages, result.blocked, remaining,
+            )
             return result
         finally:
             await context.close()
@@ -783,6 +1374,16 @@ def _urls_from_network_body(body: str, base_url: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _crawl_budget_low(margin: float = 40.0) -> bool:
+    from .._execution import remaining_execution_seconds
+    remaining = remaining_execution_seconds()
+    return remaining is not None and remaining < margin
+
+
+def _is_navigation_timeout(exc: BaseException) -> bool:
+    return 'timeout' in type(exc).__name__.lower() or 'timeout' in str(exc).lower()
+
+
 def decide_collection_end(
     *,
     discovered: int,
@@ -799,6 +1400,8 @@ def decide_collection_end(
         return False, 'no_product_urls_discovered'
     if discovered >= requested:
         return False, 'hit_product_budget_end_unconfirmed'
+    if 'operation_timeout' in notes:
+        return False, 'operation_timeout'
     if 'next_page_navigation_failed' in notes:
         return None, 'pagination_end_unconfirmed'
     if next_href:
@@ -923,6 +1526,7 @@ async def interactive_extractor_result(
         human_timeout=human_timeout,
         wait_callback=wait_callback,
     )
+    session.products = merge_colorway_records(session.products)
     if session_out is not None:
         session_out.clear()
         session_out.update({

@@ -147,6 +147,8 @@ class ExtractionResult:
     products_discovered: int | None = None
     products_failed: int | None = None
     duplicates_merged: int | None = None
+    batch_note: str = ''
+    denial: dict | None = None
 
     @property
     def outcome(self) -> str:

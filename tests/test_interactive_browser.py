@@ -44,6 +44,19 @@ def test_discover_product_urls_dedupes_and_keeps_scope():
     assert COLLECTION not in urls
 
 
+def test_discover_product_urls_skips_faq_pages_that_contain_products():
+    faq = 'https://us.louisvuitton.com/eng-us/faq/products/how-to-care-for-louis-vuitton-shoes'
+    html = (
+        '<html><body>'
+        f'<a href="{PRODUCT_A}">A</a>'
+        f'<a href="{faq}">Care</a>'
+        '</body></html>'
+    )
+    urls = ib.discover_product_urls(html, COLLECTION, max_urls=10)
+    assert urls == [PRODUCT_A]
+    assert ib.is_catalog_product_url(faq) is False
+
+
 def test_extract_product_record_from_json_ld_only_published_fields():
     payload = json.dumps({
         '@type': 'Product',
@@ -78,6 +91,127 @@ def test_extract_product_record_from_json_ld_only_published_fields():
     assert record['variants'][0]['featured_image'] == 'https://cdn.example/v.jpg'
 
 
+def test_jsonld_image_objects_and_size_color_become_variants():
+    html = """
+    <html><head>
+      <script type="application/ld+json">
+      {"@type":"Product","name":"Territory Ankle Boot","sku":"1AKZ71","color":"Brown","size":"38.0",
+       "image":[{"@type":"ImageObject","url":"https://cdn.example/front.jpg"},
+                {"@type":"ImageObject","url":"https://cdn.example/side.jpg"}],
+       "offers":{"@type":"Offer","price":"2250","priceCurrency":"USD"}}
+      </script>
+    </head><body></body></html>
+    """
+    record = ib.extract_product_record(html, PRODUCT_A)
+    assert record is not None
+    assert record['images'] == ['https://cdn.example/front.jpg', 'https://cdn.example/side.jpg']
+    assert record['variants'][0]['options'] == {'Size': '38.0', 'Color': 'Brown'}
+    assert record['variants'][0]['sku'] == '1AKZ71'
+    ib.apply_published_sizes(record, ['35.0', '38.0', '42.0', 'Size guide', '0'])
+    assert [row['options']['Size'] for row in record['variants']] == ['35.0', '38.0', '42.0']
+    assert record['variants'][1]['sku'] == '1AKZ71'
+    assert record['variants'][0]['sku'] is None
+    assert record['variants'][0]['options']['Color'] == 'Brown'
+    assert record['option_names'] == ['Size', 'Color']
+
+
+def test_normalize_size_label_accepts_common_forms():
+    assert ib.normalize_size_label('38') == '38'
+    assert ib.normalize_size_label('Size 38') == '38'
+    assert ib.normalize_size_label('38 EU') == '38'
+    assert ib.normalize_size_label('39.5') == '39.5'
+    assert ib.normalize_size_label('xl') == 'XL'
+    assert ib.normalize_size_label('Size guide') is None
+
+
+def test_sizes_from_html_skips_unavailable_markup():
+    html = """
+    <select>
+      <option value="38">38</option>
+      <option value="39" disabled>39</option>
+      <option value="40" class="sold-out">40</option>
+      <option value="41">Size 41 EU</option>
+    </select>
+    <button aria-label="42">42</button>
+    """
+    assert ib.sizes_from_html(html) == ['38', '41', '42']
+
+
+def test_color_links_keep_same_family_only():
+    page = 'https://us.louisvuitton.com/eng-us/products/territory-ankle-boot-nvprod7720056v/1AKZ71'
+    html = f"""
+    <html><body>
+      <a href="{page}" aria-label="Brown">Brown</a>
+      <a href="/eng-us/products/territory-ankle-boot-nvprod7720056v/1AKZ6L" title="Camel">Camel</a>
+      <a href="/eng-us/products/other-boot-nvprod9999999v/ZZZZZ" aria-label="Black">Black</a>
+      <a href="/eng-us/faq/products/care">Care</a>
+    </body></html>
+    """
+    links = ib.color_links_from_html(html, page)
+    brown = ib.canonical_page_url(page)
+    camel = ib.canonical_page_url(
+        'https://us.louisvuitton.com/eng-us/products/territory-ankle-boot-nvprod7720056v/1AKZ6L',
+    )
+    assert [url for url, _label in links] == [brown, camel]
+    labels = {url: label for url, label in links}
+    assert labels[brown] == 'Brown'
+    assert labels[camel] == 'Camel'
+
+
+def test_colorways_of_one_family_become_one_product():
+    brown = {
+        'title': 'Territory Ankle Boot',
+        'description': 'Shearling ankle boot.',
+        'price': '2250',
+        'currency': 'USD',
+        'sku': '1AKZ71',
+        'image_url': 'https://cdn.example/brown.jpg',
+        'additional_images': [],
+        'product_url': 'https://us.louisvuitton.com/eng-us/products/territory-ankle-boot-nvprod7720056v/1AKZ71',
+        'variants': [{
+            'title': '38',
+            'sku': '1AKZ71',
+            'price': '2250',
+            'options': {'Size': '38', 'Color': 'Brown'},
+            'featured_image': 'https://cdn.example/brown.jpg',
+        }],
+    }
+    camel = {
+        'title': 'Territory Ankle Boot',
+        'description': 'Shearling ankle boot. Camel brown.',
+        'price': '2250',
+        'currency': 'USD',
+        'sku': '1AKZ6L',
+        'image_url': 'https://cdn.example/camel.jpg',
+        'additional_images': ['https://cdn.example/camel-side.jpg'],
+        'product_url': 'https://us.louisvuitton.com/eng-us/products/territory-ankle-boot-nvprod7720056v/1AKZ6L',
+        'variants': [
+            {'title': '38', 'sku': '1AKZ6L-38', 'price': '2250', 'options': {'Size': '38', 'Color': 'Camel'}, 'featured_image': 'https://cdn.example/camel.jpg'},
+            {'title': '39', 'sku': '1AKZ6L-39', 'price': '2250', 'options': {'Size': '39', 'Color': 'Camel'}, 'featured_image': 'https://cdn.example/camel.jpg'},
+        ],
+    }
+    other = {
+        'title': 'LV Cloud Ankle Boot',
+        'description': 'Nylon boot.',
+        'price': '1240',
+        'sku': '1AKYSY',
+        'image_url': 'https://cdn.example/cloud.jpg',
+        'product_url': 'https://us.louisvuitton.com/eng-us/products/lv-cloud-ankle-boot-nvprod7720051v/1AKYSY',
+        'variants': [],
+    }
+    merged = ib.merge_colorway_records([brown, other, camel])
+    assert [item['title'] for item in merged] == ['Territory Ankle Boot', 'LV Cloud Ankle Boot']
+    territory = merged[0]
+    assert territory['description'] == 'Shearling ankle boot. Camel brown.'
+    assert territory['image_url'] == 'https://cdn.example/brown.jpg'
+    assert 'https://cdn.example/camel.jpg' in territory['additional_images']
+    pairs = {(row['options'].get('Color'), row['options'].get('Size')) for row in territory['variants']}
+    assert pairs == {('Brown', '38'), ('Camel', '38'), ('Camel', '39')}
+    assert territory['option_names'] == ['Color', 'Size']
+    assert merged[1]['sku'] == '1AKYSY'
+    assert merged[1]['variants'] == []
+
+
 def test_extract_product_record_returns_none_without_title():
     assert ib.extract_product_record('<html><body>empty</body></html>', PRODUCT_A) is None
 
@@ -91,6 +225,34 @@ def test_finite_collection_without_next_page_is_confirmed():
     )
     assert confirmed is True
     assert note == 'collection_end_confirmed_no_further_page'
+
+
+def test_operation_timeout_is_not_a_confirmed_catalog_end():
+    confirmed, note = ib.decide_collection_end(
+        discovered=72,
+        requested=1000,
+        notes=['followed_next_page_round_1', 'operation_timeout'],
+        next_href='https://shop.example/collections/shoes?page=3',
+    )
+    assert confirmed is False
+    assert note == 'operation_timeout'
+
+
+def test_human_wait_does_not_consume_execution_budget():
+    import time
+    from shopextract._execution import (
+        ExecutionPolicy,
+        execution_policy,
+        pause_execution_deadline,
+        remaining_execution_seconds,
+    )
+
+    with execution_policy(ExecutionPolicy(), 10) as state:
+        before = state.deadline
+        with pause_execution_deadline():
+            time.sleep(0.05)
+            assert remaining_execution_seconds() > 1000
+        assert state.deadline >= before + 0.04
 
 
 def test_remaining_next_page_stays_unconfirmed():
@@ -241,11 +403,83 @@ async def test_extract_uses_interactive_path_and_skips_http_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_interactive_blocked_after_human_gate(monkeypatch):
-    waiting = "<html><body class='lv-waiting'>Access Denied</body></html>"
+async def test_run_interactive_hard_denial_stops_without_retry(monkeypatch):
+    denied = (
+        '<html><body>Access denied. We invite you to return at a later time. '
+        'REF #0.75dac817.1794819823.200497c4</body></html>'
+    )
 
     class FakeResponse:
         status = 403
+        headers = {'content-type': 'text/html'}
+        url = COLLECTION
+
+        async def text(self):
+            return denied
+
+    class FakePage:
+        url = COLLECTION
+
+        def on(self, *_a, **_k):
+            return None
+
+        async def goto(self, *_a, **_k):
+            return FakeResponse()
+
+        async def content(self):
+            return denied
+
+        async def screenshot(self, **_k):
+            return b'jpeg'
+
+    class FakeContext:
+        pages = []
+
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        def __init__(self):
+            self.chromium = MagicMock()
+            self.chromium.launch_persistent_context = AsyncMock(return_value=FakeContext())
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+    import playwright.async_api as pw
+    monkeypatch.setattr(pw, 'async_playwright', lambda: FakePlaywright())
+
+    gate = AsyncMock(return_value=True)
+    monkeypatch.setattr(ib, '_human_gate', gate)
+
+    with execution_policy(ExecutionPolicy(browser=True, interactive_browser=True), 30):
+        session = await ib.run_interactive_collection(
+            COLLECTION,
+            max_products=5,
+            profile_dir=Path('artifacts') / 'browser-profiles' / 'test-lv',
+            human_timeout=5,
+            delay_range=(0, 0),
+        )
+    assert session.blocked is True
+    assert session.block_message.startswith(ACCESS_BLOCKED)
+    assert 'access_denied' in session.block_message
+    assert session.evidence['denial']['reference'] == '#0.75dac817.1794819823.200497c4'
+    assert session.evidence['denial']['completed_products'] == 0
+    gate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_interactive_waiting_room_uses_human_gate(monkeypatch):
+    waiting = "<html><body class='lv-waiting'>Please wait while we verify</body></html>"
+
+    class FakeResponse:
+        status = 200
         headers = {'content-type': 'text/html'}
         url = COLLECTION
 
@@ -269,6 +503,9 @@ async def test_run_interactive_blocked_after_human_gate(monkeypatch):
 
         async def wait_for_load_state(self, *_a, **_k):
             return None
+
+        async def screenshot(self, **_k):
+            return b'jpeg'
 
         def locator(self, *_a, **_k):
             loc = MagicMock()
@@ -309,6 +546,7 @@ async def test_run_interactive_blocked_after_human_gate(monkeypatch):
             profile_dir=Path('artifacts') / 'browser-profiles' / 'test-lv',
             human_timeout=5,
             wait_callback=immediate_wait,
+            delay_range=(0, 0),
         )
     assert session.blocked is True
     assert session.block_message is not None

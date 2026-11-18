@@ -9,7 +9,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -101,6 +101,21 @@ def _is_http_url(url: str) -> bool:
     if host in ('localhost', '127.0.0.1', '::1') or host.endswith('.local'):
         return False
     return True
+
+
+def image_asset_key(url: str) -> str:
+    """Identity for the same published image across rendition query strings.
+
+    Louis Vuitton serves one Scene7 asset as several filenames and widths.
+    The id after ``--`` is that asset. Other hosts fall back to host + path.
+    """
+    parts = urlsplit(unquote(url or ''))
+    host = (parts.hostname or '').lower()
+    path = parts.path.lower()
+    token = re.search(r'--([a-z0-9]{6,})', path)
+    if host and token:
+        return f'{host}::{token.group(1)}'
+    return f'{host}{path}'
 
 
 def normalize_image_url(url: str) -> str:
@@ -321,16 +336,40 @@ def write_image_cache(profile_dir: Path | str | None, url: str, content: bytes) 
     return path
 
 
+def _read_cached_file(path: Path) -> bytes | None:
+    if not path.is_file():
+        return None
+    content = path.read_bytes()
+    if detect_image(content) is None:
+        return None
+    return content
+
+
 def read_image_cache(profile_dir: Path | str | None, url: str) -> bytes | None:
     root = image_cache_dir(profile_dir)
     if root is None:
         return None
     key = cache_key_for_url(url)
     for ext, _mime in (('jpg', 'image/jpeg'), ('png', 'image/png'), ('webp', 'image/webp'), ('gif', 'image/gif')):
-        path = root / f'{key}.{ext}'
-        if path.is_file():
-            content = path.read_bytes()
-            if detect_image(content) is not None:
+        content = _read_cached_file(root / f'{key}.{ext}')
+        if content is not None:
+            return content
+    wanted = image_asset_key(url)
+    if '::' not in wanted:
+        return None
+    for meta in root.glob('*.json'):
+        if meta.name.startswith('_'):
+            continue
+        try:
+            data = json.loads(meta.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            continue
+        source = data.get('source_url') if isinstance(data, dict) else None
+        if not isinstance(source, str) or image_asset_key(source) != wanted:
+            continue
+        for ext in ('jpg', 'png', 'webp', 'gif'):
+            content = _read_cached_file(root / f'{meta.stem}.{ext}')
+            if content is not None:
                 return content
     return None
 
@@ -360,11 +399,44 @@ def _prefer_product_page(asset: ImageAsset) -> str | None:
     return _origin_referer(asset.source_url)
 
 
+async def _page_shows_access_block(page) -> bool:
+    try:
+        html = await page.content()
+    except Exception:
+        return False
+    from .._access import detect_access_block
+    return detect_access_block(url=page.url, status=None, body=html) is not None
+
+
+async def _wait_for_visible_product_page(page, profile_dir: Path, *, seconds: float) -> bool:
+    """Leave the headed window open so a person can pass the site's own gate.
+
+    Does not solve a challenge or change the browser identity. A hard denial that
+    stays up until the deadline is returned as not ready.
+    """
+    from ..extractors._interactive_browser import clear_continue, continue_path
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, seconds)
+    while True:
+        if not await _page_shows_access_block(page):
+            return True
+        if continue_path(profile_dir).is_file():
+            clear_continue(profile_dir)
+            with contextlib.suppress(Exception):
+                await page.reload(wait_until='domcontentloaded', timeout=60000)
+            if not await _page_shows_access_block(page):
+                return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return not await _page_shows_access_block(page)
+        await page.wait_for_timeout(2000)
+
+
 async def _fetch_images_via_browser_profile(
     assets: list[ImageAsset],
     profile_dir: Path,
     *,
     timeout_ms: int = 45000,
+    human_wait_s: float = 150.0,
 ) -> dict[str, bytes | Exception]:
     """Fetch image bytes using cookies from an interactive Chromium profile.
 
@@ -399,11 +471,13 @@ async def _fetch_images_via_browser_profile(
                 for asset in assets:
                     seed = _prefer_product_page(asset) or _origin_referer(asset.source_url) or ''
                     grouped.setdefault(seed, []).append(asset)
+                gate_budget = human_wait_s
                 for seed, group in grouped.items():
                     wanted = {a.source_url: a for a in group}
                     captured: dict[str, bytes] = {}
+                    captured_by_key: dict[str, bytes] = {}
 
-                    async def on_response(response, wanted=wanted, captured=captured) -> None:
+                    async def on_response(response, wanted=wanted, captured=captured, captured_by_key=captured_by_key) -> None:
                         try:
                             if response.status != 200:
                                 return
@@ -413,18 +487,23 @@ async def _fetch_images_via_browser_profile(
                             body = await response.body()
                             if detect_image(body) is None:
                                 return
-                            # Exact URL or normalized match against wanted set.
+                            key = image_asset_key(response.url)
+                            if key:
+                                captured_by_key.setdefault(key, body)
                             if response.url in wanted:
                                 captured[response.url] = body
                                 return
                             norm = normalize_image_url(response.url)
                             for source_url in list(wanted):
-                                if normalize_image_url(source_url) == norm:
+                                if normalize_image_url(source_url) == norm or (
+                                    key and image_asset_key(source_url) == key
+                                ):
                                     captured[source_url] = body
                         except Exception:
                             return
 
                     page.on('response', on_response)
+                    page_ready = False
                     if seed:
                         with contextlib.suppress(Exception):
                             await page.goto(
@@ -432,39 +511,40 @@ async def _fetch_images_via_browser_profile(
                                 wait_until='domcontentloaded',
                                 timeout=min(timeout_ms, 60000),
                             )
-                            with contextlib.suppress(Exception):
-                                await page.wait_for_timeout(1200)
-                                await page.mouse.wheel(0, 1800)
-                                await page.wait_for_timeout(800)
+                            page_ready = await _wait_for_visible_product_page(
+                                page, profile_dir, seconds=gate_budget,
+                            )
+                            gate_budget = min(gate_budget, 8.0)
+                            if page_ready:
+                                with contextlib.suppress(Exception):
+                                    await page.evaluate(
+                                        """() => {
+                                          for (const img of document.images) {
+                                            const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || '';
+                                            if (lazy && (!img.src || img.src.startsWith('data:'))) img.src = lazy;
+                                            img.loading = 'eager';
+                                          }
+                                        }"""
+                                    )
+                                    await page.mouse.wheel(0, 1800)
+                                    await page.wait_for_timeout(2500)
                     for asset in group:
                         url = asset.source_url
+                        if url not in captured:
+                            key = image_asset_key(url)
+                            if key and key in captured_by_key:
+                                captured[url] = captured_by_key[key]
                         if url in captured:
                             results[url] = captured[url]
                             continue
-                        try:
-                            response = await page.request.get(
-                                url,
-                                timeout=timeout_ms,
-                                headers={
-                                    **_BROWSER_HEADERS,
-                                    **({'Referer': seed} if seed else {}),
-                                },
+                        if not page_ready:
+                            results[url] = RuntimeError(
+                                'product page is still the access-denied screen, so its images were not loaded'
                             )
-                            if not response.ok:
-                                raise httpx.HTTPStatusError(
-                                    f'HTTP {response.status}',
-                                    request=httpx.Request('GET', url),
-                                    response=httpx.Response(
-                                        response.status,
-                                        request=httpx.Request('GET', url),
-                                    ),
-                                )
-                            body = await response.body()
-                            if detect_image(body) is None:
-                                raise ValueError('browser_fetch_not_image')
-                            results[url] = body
-                        except Exception as exc:
-                            results[url] = exc
+                        else:
+                            results[url] = RuntimeError(
+                                'product page did not load this image'
+                            )
                     with contextlib.suppress(Exception):
                         page.remove_listener('response', on_response)
             finally:

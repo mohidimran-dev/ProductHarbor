@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -59,6 +60,44 @@ class ShopifyUploadError(RuntimeError):
     pass
 
 
+class ShopifyStoreAccessError(ShopifyUploadError):
+    """Store-level scope/permission failure — stop the whole CSV import."""
+
+
+def is_file_create_access_denied(exc: BaseException | str) -> bool:
+    text = str(exc).lower()
+    if 'access denied for filecreate' in text:
+        return True
+    if 'access denied' in text and (
+        'write_files' in text or 'write_images' in text or 'create files permission' in text
+    ):
+        return True
+    return False
+
+
+def file_create_access_denied_message(*, scopes_granted: bool | None = None) -> str:
+    if scopes_granted is False:
+        return (
+            'Shopify denied fileCreate because write_files is missing on this token. '
+            'In Shopify Admin → Settings → Apps → Develop apps → your app → Configuration, '
+            'enable write_products, read_products, write_files, and read_files. '
+            'Save, reinstall the app so Shopify issues a new Admin API token, then Disconnect '
+            'and Save connection in Product Harbor with that new token.'
+        )
+    if scopes_granted is True:
+        return (
+            'Shopify denied fileCreate even though write_files is granted on the app. '
+            'The staff account tied to this token needs Files → Create permission '
+            '(Shopify Admin → Settings → Users and permissions). Fix that, then retry '
+            'the CSV import — do not re-run all products until one image upload succeeds.'
+        )
+    return (
+        'Shopify denied fileCreate (Files upload). Confirm the custom app has write_files '
+        '(and read_files), reinstall to refresh the Admin API token, reconnect in Product Harbor, '
+        'and ensure the staff user has Files → Create permission. Then retry one product first.'
+    )
+
+
 async def graphql(conn: ShopifyConnection, query: str, variables: dict | None = None) -> dict:
     headers = {
         'Content-Type': 'application/json',
@@ -82,6 +121,8 @@ async def graphql(conn: ShopifyConnection, query: str, variables: dict | None = 
                 messages = '; '.join(
                     str(err.get('message') or err) for err in data['errors']
                 )
+                if is_file_create_access_denied(messages):
+                    raise ShopifyStoreAccessError(file_create_access_denied_message())
                 raise ShopifyUploadError(f'GraphQL error: {messages}')
             return data.get('data') or {}
     raise ShopifyUploadError('Shopify GraphQL rate-limited or unavailable after retries')
@@ -144,21 +185,30 @@ async def create_file_and_wait_cdn(
     *,
     resource_url: str,
     alt: str = '',
+    filename: str | None = None,
     poll_timeout: float = 90.0,
 ) -> tuple[str, str]:
     """fileCreate then poll until READY; return (file_id, cdn_url)."""
-    data = await graphql(conn, FILE_CREATE, {
-        'files': [{
-            'originalSource': resource_url,
-            'contentType': 'IMAGE',
-            'alt': alt or None,
-            'duplicateResolutionMode': 'REPLACE',
-        }],
-    })
+    # APPEND_UUID keeps each product's bytes. REPLACE + shared names like csv-0.jpg
+    # made every later product overwrite earlier Files library entries.
+    name = (filename or '').strip() or Path(urlsplit(resource_url).path).name or 'product-image.jpg'
+    if not Path(name).suffix:
+        name = f'{name}.jpg'
+    file_input: dict = {
+        'originalSource': resource_url,
+        'contentType': 'IMAGE',
+        'alt': alt or None,
+        'filename': name,
+        'duplicateResolutionMode': 'APPEND_UUID',
+    }
+    data = await graphql(conn, FILE_CREATE, {'files': [file_input]})
     payload = data.get('fileCreate') or {}
     errors = payload.get('userErrors') or []
     if errors:
-        raise ShopifyUploadError('; '.join(e.get('message') or str(e) for e in errors))
+        joined = '; '.join(e.get('message') or str(e) for e in errors)
+        if is_file_create_access_denied(joined):
+            raise ShopifyStoreAccessError(file_create_access_denied_message())
+        raise ShopifyUploadError(joined)
     files = payload.get('files') or []
     if not files:
         raise ShopifyUploadError('fileCreate returned no files')
@@ -265,7 +315,12 @@ async def upload_assets_to_shopify(
             try:
                 alt = asset.associations[0].alt if asset.associations else ''
                 resource_url = await staged_upload_file(conn, asset)
-                file_id, cdn = await create_file_and_wait_cdn(conn, resource_url=resource_url, alt=alt)
+                file_id, cdn = await create_file_and_wait_cdn(
+                    conn,
+                    resource_url=resource_url,
+                    alt=alt,
+                    filename=asset.filename,
+                )
                 asset.shopify_file_id = file_id
                 asset.shopify_cdn_url = cdn
                 if asset.local_path:

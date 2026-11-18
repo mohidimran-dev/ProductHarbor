@@ -155,6 +155,22 @@ def remaining_execution_seconds():
     return max(0.0,state.deadline-time.monotonic()) if state is not None else None
 
 
+@contextmanager
+def pause_execution_deadline():
+    """Keep a human wait from consuming the crawl budget."""
+    state = current_state()
+    if state is None:
+        yield
+        return
+    started = time.monotonic()
+    previous = state.deadline
+    state.deadline = started + 24 * 60 * 60
+    try:
+        yield
+    finally:
+        state.deadline = previous + (time.monotonic() - started)
+
+
 def current_policy() -> ExecutionPolicy | None:
     state = current_state()
     return state.policy if state else None

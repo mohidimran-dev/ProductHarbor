@@ -13,8 +13,16 @@ from typing import Any
 # 2025-10 became inaccessible after 2026-10-16 15:00 UTC (Shopify falls forward).
 # Pin a currently accessible stable Admin GraphQL version.
 SHOPIFY_API_VERSION = '2026-10'
-REQUIRED_SCOPES = ('write_files', 'read_files')
+REQUIRED_SCOPES = ('write_products', 'read_products', 'write_files', 'read_files')
 SHOP_HOST_RE = re.compile(r'^[a-z0-9][a-z0-9\-]*\.myshopify\.com$', re.I)
+REAUTHORIZE_HINT = (
+    'Reauthorize: Shopify Admin → Settings → Apps and sales channels → Develop apps → '
+    'your app → Configuration. Enable Admin API scopes '
+    f'{", ".join(REQUIRED_SCOPES)}. Save, then Install app / reinstall so Shopify issues a '
+    'fresh Admin API access token. In Product Harbor, Disconnect store, paste the new token, '
+    'and Save connection. If write_files is already listed but fileCreate still fails, grant '
+    'the staff user Files → Create under Settings → Users and permissions.'
+)
 
 # Read-only GraphQL: auth + granted scopes + Files library readability.
 # Never logs or returns the access token.
@@ -57,7 +65,8 @@ class ShopifyConnection:
             'shop': self.shop,
             'api_version': self.api_version,
             'required_scopes': list(REQUIRED_SCOPES),
-            'note': 'Product Harbor uploads media only (write_files / read_files).',
+            'reauthorize_hint': REAUTHORIZE_HINT,
+            'note': 'Product Harbor can create products and upload their images with this connection.',
         }
 
 
@@ -111,7 +120,7 @@ def save_connection(artifacts_root: Path, *, shop: str, access_token: str, api_v
         'access_token': conn.access_token,
         'api_version': conn.api_version,
         'required_scopes': list(REQUIRED_SCOPES),
-        'purpose': 'Product Harbor media-only uploads (Files API)',
+        'purpose': 'Product Harbor product create plus image uploads',
     }
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(payload, indent=2), encoding='utf-8')
@@ -140,9 +149,10 @@ def public_connection_status(artifacts_root: Path) -> dict:
             'setup_hint': (
                 'Create a custom app in Shopify Admin → Settings → Apps → Develop apps. '
                 f'Enable Admin API scopes {", ".join(REQUIRED_SCOPES)}. '
-                'Install the app, then run: python scripts/setup_shopify_connection.py '
-                '(interactive; token is entered via getpass, never printed).'
+                'Install the app, then paste the Admin API access token here '
+                '(or run: python scripts/setup_shopify_connection.py).'
             ),
+            'reauthorize_hint': REAUTHORIZE_HINT,
         }
     return conn.public_status
 
@@ -253,8 +263,12 @@ async def verify_connection_readonly(conn: ShopifyConnection) -> dict[str, Any]:
         # Defensive: rare installs may expose files without listing the handle.
         missing = [s for s in missing if s != 'read_files']
 
+    ok = not missing and bool(shop_info.get('myshopifyDomain') or shop_info.get('name'))
+    error = None
+    if missing:
+        error = f'Missing required Admin API scopes: {", ".join(missing)}'
     return {
-        'ok': not missing and bool(shop_info.get('myshopifyDomain') or shop_info.get('name')),
+        'ok': ok,
         'shop': conn.shop,
         'api_version': conn.api_version,
         'shop_name': shop_info.get('name'),
@@ -263,8 +277,6 @@ async def verify_connection_readonly(conn: ShopifyConnection) -> dict[str, Any]:
         'missing_scopes': missing,
         'required_scopes': list(REQUIRED_SCOPES),
         'files_readable': files_readable,
-        'error': (
-            None if not missing
-            else f'Missing required Admin API scopes: {", ".join(missing)}'
-        ),
+        'reauthorize_hint': REAUTHORIZE_HINT if (missing or not ok) else None,
+        'error': error,
     }

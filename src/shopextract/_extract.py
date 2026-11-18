@@ -519,14 +519,16 @@ async def _extract_interactive_collection(
     remaining = remaining_execution_seconds()
     # Reserve time for product navigation after the human gate.
     human_timeout = 240.0 if remaining is None else max(30.0, min(240.0, remaining - 45.0))
+    from .run_control import activate_run_pace
     session_meta: dict = {}
-    extractor = await interactive_extractor_result(
-        url,
-        max_products=max_urls,
-        profile_dir=profile,
-        human_timeout=human_timeout,
-        session_out=session_meta,
-    )
+    with activate_run_pace():
+        extractor = await interactive_extractor_result(
+            url,
+            max_products=max_urls,
+            profile_dir=profile,
+            human_timeout=human_timeout,
+            session_out=session_meta,
+        )
     products: list[Product] = []
     for raw in extractor.products:
         try:
@@ -551,16 +553,19 @@ async def _extract_interactive_collection(
                 featured_image_id=item.get('featured_image_id') if isinstance(item.get('featured_image_id'), str) else None,
             ))
         currency = raw.get('currency') if isinstance(raw.get('currency'), str) else ''
+        family_id = raw.get('family_id') if isinstance(raw.get('family_id'), str) else ''
         product = Product(
             title=str(raw.get('title') or ''),
             description=str(raw.get('description') or ''),
             price=price,
             currency=currency,
+            external_id=family_id,
             image_url=str(raw.get('image_url') or ''),
             additional_images=[i for i in (raw.get('additional_images') or []) if isinstance(i, str)],
             product_url=str(raw.get('product_url') or url),
             sku=raw.get('sku') if isinstance(raw.get('sku'), str) else None,
             variants=variants,
+            option_names=[n for n in (raw.get('option_names') or []) if isinstance(n, str)],
             platform=platform,
             raw_data=raw,
         )
@@ -587,7 +592,7 @@ async def _extract_interactive_collection(
     # A confirmed end is evidence of success. Only an unconfirmed end is an error.
     if session_meta.get('pagination_end_confirmed') is False and extractor.completeness_reason != ACCESS_BLOCKED:
         errors.append('pagination_end_confirmed=False')
-    return ExtractionResult(
+    built = ExtractionResult(
         observation_scope=observation_scope,
         catalog_complete=catalog_complete,
         incompleteness_reasons=list(dict.fromkeys(reasons)),
@@ -604,6 +609,20 @@ async def _extract_interactive_collection(
         products_failed=session_meta.get('failed_pages'),
         duplicates_merged=dedupe_stats.duplicate_product_observations_merged,
     )
+    evidence = session_meta.get('evidence') or {}
+    notes = []
+    skipped = evidence.get('families_skipped_existing') or 0
+    remaining = evidence.get('families_remaining') or 0
+    if skipped:
+        notes.append(f'Skipped {skipped} family(s) already in Shopify.')
+    if remaining:
+        notes.append(f'{remaining} listed family(s) remain for the next run.')
+    if notes:
+        built.batch_note = ' '.join(notes)
+    denial = evidence.get('denial')
+    if isinstance(denial, dict):
+        built.denial = denial
+    return built
 
 
 # Provider-specific env var mapping

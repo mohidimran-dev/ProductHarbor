@@ -17,7 +17,7 @@ from shopextract.dashboard.jobs import MODE_MAX
 
 @pytest.fixture
 async def client(tmp_path, monkeypatch):
-    app = create_app(export_root=tmp_path / 'jobs')
+    app = create_app(export_root=tmp_path / 'jobs', artifacts_root=tmp_path / 'artifacts')
     server = TestServer(app)
     test_client = TestClient(server)
     await test_client.start_server()
@@ -149,6 +149,30 @@ async def test_access_blocked_outcome_preserves_export(client):
     assert ACCESS_BLOCKED in status['job']['message']
     assert status['job']['downloads']['products_json'] is False
     assert json.loads(prior.read_text(encoding='utf-8'))['products'][0]['title'] == 'Kept'
+
+
+@pytest.mark.asyncio
+async def test_blocked_run_with_products_keeps_exports(client):
+    test_client, monkeypatch, _app = client
+
+    async def blocked_with_products(*a, **k):
+        return ExtractionResult(
+            products=[Product(title='Kept shoe', price=Decimal('12.00'), currency='USD',
+                              product_url='https://shop.example/products/kept',
+                              platform=Platform.GENERIC)],
+            platform=Platform.GENERIC, tier=ExtractionTier.UNIFIED_CRAWL,
+            catalog_complete=False, incompleteness_reasons=[ACCESS_BLOCKED],
+            errors=[f'{ACCESS_BLOCKED} url=https://shop.example/faq/products/care status=403 reason=waiting_interstitial'],
+        )
+
+    patch_extract(monkeypatch, blocked_with_products)
+    payload = await (await test_client.post('/api/jobs', json={
+        'url': 'https://shop.example/collections/shoes', 'tab': 'custom', 'mode': 'test',
+    })).json()
+    status = await wait_terminal(test_client, payload['job']['job_id'])
+    assert status['job']['state'] == 'partial'
+    assert status['job']['downloads']['products_json'] is True
+    assert 'Kept' in status['job']['message']
 
 
 @pytest.mark.asyncio

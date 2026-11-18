@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/dashboard.css" />
+  <link rel="stylesheet" href="/static/dashboard.css?v=20261117a" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
@@ -119,14 +119,54 @@
     <section id="workspace" class="section">
       <div class="section-intro">
         <h2>Extraction workspace</h2>
-        <p>This is the live ProductHarbor console on your machine. Progress and completeness come only from job evidence.</p>
+        <p>Follow the four steps in order. The orange button is the only action that matters right now.</p>
       </div>
 
+      <p id="next-step" class="next-step" aria-live="polite">Step 1. Enter the store domain and Admin API token, then save the connection.</p>
+
       <div class="workspace">
+        <section class="panel" aria-label="Shopify connection">
+          <div class="panel-head">
+            <h3>1. Connect the store</h3>
+            <p class="panel-sub">Save the shop domain and Admin token. Then turn on live upload so each scraped product is created once, with its title, description, images, and variants.</p>
+          </div>
+          <div class="shopify-conn">
+            <p class="label">Shopify connection</p>
+            <p id="shopify-status" class="value">Checking…</p>
+            <p id="shopify-hint" class="note"></p>
+            <div id="shopify-connect-form" class="shopify-form hidden">
+              <label class="field">
+                <span>Store domain</span>
+                <input id="shopify-shop" type="text" placeholder="your-store.myshopify.com" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>Admin API access token</span>
+                <input id="shopify-token" type="password" placeholder="shpat_…" autocomplete="off" />
+              </label>
+              <div class="actions">
+                <button type="button" id="shopify-save" class="primary">Save connection</button>
+              </div>
+            </div>
+            <div class="actions">
+              <button type="button" id="shopify-live-upload" class="ghost" disabled>Upload each scraped product</button>
+              <button type="button" id="shopify-csv-import" class="ghost" disabled>Import CSV to Shopify</button>
+              <input id="shopify-csv-file" type="file" accept=".csv,text/csv" hidden />
+              <button type="button" id="shopify-csv-cancel" class="ghost hidden" disabled>Cancel CSV import</button>
+              <button type="button" id="shopify-disconnect" class="ghost hidden">Disconnect store</button>
+            </div>
+            <p id="shopify-live-status" class="note">Connect the store, then turn upload on before you start.</p>
+            <div id="shopify-csv-panel" class="csv-import-panel">
+              <p id="shopify-csv-store" class="note">Connect a store to import a product CSV into Shopify.</p>
+              <p id="shopify-csv-status" class="message">No CSV import yet.</p>
+              <ul id="shopify-csv-results" class="reasons"></ul>
+            </div>
+          </div>
+        </section>
+
         <section class="panel" aria-label="Extraction controls">
           <div class="panel-head">
-            <h3>Collection run</h3>
-            <p class="panel-sub">Choose a backend path, paste a collection URL, then start.</p>
+            <h3>2. Start the scrape</h3>
+            <p class="panel-sub">Pick the storefront type, paste one collection URL, then press Start. Test stops at 5 products.</p>
           </div>
 
           <div class="tabs" role="tablist">
@@ -144,7 +184,7 @@
           <fieldset class="modes">
             <legend>Mode</legend>
             <label><input type="radio" name="mode" value="test" checked /> Test <em>(5 products)</em></label>
-            <label><input type="radio" name="mode" value="full" /> Full collection <em>(up to 1000)</em></label>
+            <label><input type="radio" name="mode" value="full" /> Batch <em>(up to 15 products, slow pace)</em></label>
           </fieldset>
 
           <label id="interactive-wrap" class="field checkbox hidden">
@@ -152,9 +192,14 @@
             <span>Interactive headed browser — persistent profile; you clear CAPTCHA or login yourself</span>
           </label>
 
+          <label class="field checkbox">
+            <input id="schedule-daily" type="checkbox" />
+            <span>Scheduled mode — keep running daily batches until cancelled. Cooldown still applies after a denial.</span>
+          </label>
+          <p id="cooldown-status" class="note" aria-live="polite"></p>
+
           <div class="actions">
-            <button type="button" id="start" class="primary">Start</button>
-            <button type="button" id="continue" class="ghost" disabled>Continue</button>
+            <button type="button" id="start" class="ghost">Start scrape</button>
             <button type="button" id="cancel" class="ghost" disabled>Cancel</button>
           </div>
           <aside id="human-gate" class="human-gate hidden" aria-live="polite">
@@ -167,8 +212,11 @@
 
         <section class="panel" aria-label="Job status">
           <div class="panel-head">
-            <h3>Run status</h3>
-            <p class="panel-sub">Counts and completeness update only from job evidence.</p>
+            <h3>3. Follow this run</h3>
+            <p class="panel-sub">If a Chromium window opens, finish what it shows, then press Continue. An access denial cannot be clicked through.</p>
+          </div>
+          <div class="actions follow-actions">
+            <button type="button" id="continue" class="ghost" disabled>Continue</button>
           </div>
 
           <div class="status-row">
@@ -208,37 +256,20 @@
           </div>
         </section>
 
-        <section class="panel" aria-label="Product Harbor media exports">
+        <section class="panel" aria-label="Product preview">
           <div class="panel-head">
-            <h3>Product Harbor media</h3>
-            <p class="panel-sub">Download a backup ZIP, or prepare a Shopify-ready CSV with CDN image URLs. Product Harbor uploads media only — it does not create products.</p>
+            <h3>4. Check the products</h3>
+            <p class="panel-sub">Cards appear as products are admitted. Colors of the same model stay on one product. Downloads appear after the run keeps its files.</p>
           </div>
+          <div id="preview" class="preview empty">No products yet.</div>
+        </section>
 
-          <div class="shopify-conn">
-            <p class="label">Shopify connection</p>
-            <p id="shopify-status" class="value">Checking…</p>
-            <p id="shopify-hint" class="note"></p>
-            <div id="shopify-connect-form" class="shopify-form hidden">
-              <label class="field">
-                <span>Store domain</span>
-                <input id="shopify-shop" type="text" placeholder="your-store.myshopify.com" autocomplete="off" />
-              </label>
-              <label class="field">
-                <span>Admin API access token</span>
-                <input id="shopify-token" type="password" placeholder="shpat_…" autocomplete="off" />
-              </label>
-              <div class="actions">
-                <button type="button" id="shopify-save" class="primary">Save connection</button>
-              </div>
-            </div>
-            <div class="actions">
-              <button type="button" id="shopify-disconnect" class="ghost hidden">Disconnect store</button>
-            </div>
-          </div>
-
+        <details class="panel optional-tools">
+          <summary>Optional file backup</summary>
+          <p class="panel-sub">Use this only if you want a ZIP or a CSV with Shopify CDN image links. Live upload already creates the products.</p>
           <div class="media-actions actions">
             <button type="button" id="media-zip" class="ghost" disabled>Download CSV + Images ZIP</button>
-            <button type="button" id="media-shopify" class="primary" disabled>Prepare Shopify-ready CSV</button>
+            <button type="button" id="media-shopify" class="ghost" disabled>Prepare Shopify-ready CSV</button>
             <button type="button" id="media-cancel" class="ghost" disabled>Cancel media job</button>
             <button type="button" id="media-resume" class="ghost" disabled>Resume</button>
           </div>
@@ -254,8 +285,8 @@
             <a id="download-shopify-ready" class="download disabled" href="#">Shopify-ready CSV</a>
             <a id="download-media-failure" class="download disabled" href="#">Failure report</a>
           </div>
-          <p class="note">Use “Prepare Shopify-ready CSV” before Admin import: Product Harbor downloads images, uploads them to your store Files CDN, then rewrites the CSV. Plain “Download for Shopify” keeps source image URLs — protected brand CDNs (403) will make Shopify reject the import. ZIP is a local backup only; Shopify cannot import those local image files.</p>
-        </section>
+          <p class="note">The ZIP is a local backup. Shopify cannot import those image files. The Shopify-ready CSV is only for a manual Admin import.</p>
+        </details>
 
         <section id="live-panel" class="panel hidden" aria-label="Live browser preview">
           <div class="panel-head">
@@ -268,13 +299,6 @@
           </div>
         </section>
 
-        <section class="panel" aria-label="Product preview">
-          <div class="panel-head">
-            <h3>Product preview</h3>
-            <p class="panel-sub">Admitted products appear here as evidence arrives.</p>
-          </div>
-          <div id="preview" class="preview empty">No products yet.</div>
-        </section>
       </div>
     </section>
 
@@ -321,6 +345,6 @@
     </div>
   </footer>
 
-  <script src="/static/dashboard.js"></script>
+  <script src="/static/dashboard.js?v=20261117a"></script>
 </body>
 </html>

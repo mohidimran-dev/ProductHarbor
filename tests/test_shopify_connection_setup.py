@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from shopextract.dashboard.shopify_connection import (
+    REAUTHORIZE_HINT,
     REQUIRED_SCOPES,
     ShopifyConnection,
     _sanitize_graphql_error_text,
@@ -13,6 +14,7 @@ from shopextract.dashboard.shopify_connection import (
     save_connection,
     verify_connection_readonly,
 )
+from shopextract.dashboard.shopify_files import is_file_create_access_denied
 
 
 def test_sanitize_redacts_token_like_substrings():
@@ -55,7 +57,7 @@ async def test_verify_connection_readonly_reports_missing_scopes(monkeypatch):
                 'data': {
                     'shop': {'name': 'Demo', 'myshopifyDomain': 'demo-store.myshopify.com'},
                     'currentAppInstallation': {
-                        'accessScopes': [{'handle': 'read_products'}],
+                        'accessScopes': [{'handle': 'read_orders'}],
                     },
                     'files': None,
                 }
@@ -103,6 +105,8 @@ async def test_verify_connection_readonly_ok_when_scopes_present(monkeypatch):
                         'accessScopes': [
                             {'handle': 'read_files'},
                             {'handle': 'write_files'},
+                            {'handle': 'read_products'},
+                            {'handle': 'write_products'},
                         ],
                     },
                     'files': {'edges': []},
@@ -126,6 +130,16 @@ async def test_verify_connection_readonly_ok_when_scopes_present(monkeypatch):
     assert result['ok'] is True
     assert result['missing_scopes'] == []
     assert result['files_readable'] is True
+
+
+def test_required_scopes_include_write_files_and_reauth_hint():
+    assert 'write_files' in REQUIRED_SCOPES
+    assert 'read_files' in REQUIRED_SCOPES
+    assert 'write_files' in REAUTHORIZE_HINT
+    assert 'reinstall' in REAUTHORIZE_HINT.lower()
+    assert is_file_create_access_denied(
+        'Access denied for fileCreate field. Required access: `write_files`'
+    )
 
 
 def test_setup_script_uses_getpass_and_not_argv_token():

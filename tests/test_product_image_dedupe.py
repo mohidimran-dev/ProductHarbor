@@ -21,6 +21,7 @@ from shopextract.dashboard.image_assets import (
     apply_content_dedupe_to_products,
     collect_image_assets,
     download_assets,
+    image_asset_key,
     normalize_image_url,
     pixel_fingerprint,
 )
@@ -358,6 +359,19 @@ def test_shopify_csv_keeps_variant_and_image_rows():
     assert any(r['SKU'] == 'T-B' and r['Variant image URL'] == '' for r in rows)
     positions = [r['Image position'] for r in rows if r['Product image URL']]
     assert '1' in positions and '2' in positions and '3' in positions
+
+
+def test_image_asset_key_matches_louis_vuitton_renditions():
+    saved = (
+        'https://us.louisvuitton.com/images/is/image/lv/1/PP_VP_L/'
+        'louis-vuitton--A1RS4ASH92_PM2_Front%20view.jpg?wid=1200&hei=630'
+    )
+    displayed = (
+        'https://us.louisvuitton.com/images/is/image/lv/1/PP_VP_L/'
+        'louis-vuitton-territory-ankle-boot--A1RS4ASH92_PM2_Front view.jpg'
+    )
+    assert image_asset_key(saved) == image_asset_key(displayed)
+    assert image_asset_key(saved) != image_asset_key(displayed.replace('A1RS4ASH92', 'OTHER123456'))
 
 
 def test_normalize_image_url_preserves_signed_and_size_params():

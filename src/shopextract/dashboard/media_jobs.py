@@ -303,6 +303,37 @@ class MediaJobManager:
             conn = load_connection(self.artifacts_root)
             if conn is None:
                 raise ValueError('Shopify connection disappeared before upload.')
+            from .shopify_connection import verify_connection_readonly
+            check = await verify_connection_readonly(conn)
+            if not check.get('ok'):
+                job.state = 'partial' if job.downloaded else 'failed'
+                job.partial = True
+                job.resumable = True
+                job.message = (
+                    f"Shopify refused the Admin token for {conn.shop}. "
+                    f"{check.get('error') or 'Reconnect the store.'} "
+                    'Downloaded images stay on this machine. Create a new Admin token '
+                    'with write_products, read_products, write_files, and read_files, then connect it again.'
+                )
+                fail_path = work_dir / 'shopify-ready-failure-report.json'
+                fail_path.write_text(json.dumps({
+                    'package': 'Product Harbor',
+                    'shop': conn.shop,
+                    'partial': True,
+                    'error': check.get('error'),
+                    'download': {
+                        'total': job.download_total,
+                        'downloaded': job.downloaded,
+                        'failed': job.download_failed,
+                    },
+                    'upload': {'total': 0, 'uploaded': 0, 'failed': 0},
+                    'failures': [{
+                        'source_url': None,
+                        'error': job.message,
+                    }],
+                }, indent=2), encoding='utf-8')
+                job.failure_report_path = str(fail_path)
+                return
             if job.shop and job.shop != conn.shop:
                 raise ValueError('Destination store changed; refusing to reuse mappings.')
             job.shop = conn.shop

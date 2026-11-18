@@ -23,3 +23,16 @@ def test_image_cache_roundtrip(tmp_path: Path):
 
 def test_image_cache_rejects_html(tmp_path: Path):
     assert write_image_cache(tmp_path, 'https://cdn.example/x.jpg', b'<html>nope</html>') is None
+
+
+def test_image_cache_matches_scene7_asset_across_filenames(tmp_path: Path):
+    saved = (
+        'https://us.louisvuitton.com/images/is/image/lv/1/PP_VP_L/'
+        'louis-vuitton-territory-ankle-boot--A1RS4ASH92_PM2_Front%20view.png?wid=730&hei=730'
+    )
+    wanted = (
+        'https://us.louisvuitton.com/images/is/image/lv/1/PP_VP_L/'
+        'louis-vuitton--A1RS4ASH92_PM2_Front%20view.jpg?wid=1200&hei=630'
+    )
+    write_image_cache(tmp_path, saved, PNG_1X1)
+    assert read_image_cache(tmp_path, wanted) == PNG_1X1
